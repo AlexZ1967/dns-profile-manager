@@ -95,7 +95,7 @@ class CoreTests(unittest.TestCase):
             args=run.call_args.args[0]
             self.assertIn('+tls-ca',args); self.assertIn('+tls-hostname=api.magicdns.ru',args); self.assertIn('+tls-sni=api.magicdns.ru',args)
         self.assertTrue(answer['ok'])
-        with patch.object(m,'run',return_value=subprocess.CompletedProcess([],0,'403\t0.1\t0.2','')) as run:
+        with patch.object(m,'run',return_value=subprocess.CompletedProcess([],0,json.dumps({'http_code':403,'time_connect':0.1,'time_appconnect':0.2,'time_starttransfer':0.3,'ssl_verify_result':0}),'')) as run:
             result=m.https_query('github.com','203.0.113.7',5)
             args=run.call_args.args[0]
             self.assertIn('github.com:443:203.0.113.7',args); self.assertIn('--resolve',args); self.assertIn('--noproxy',args)
@@ -107,7 +107,7 @@ class CoreTests(unittest.TestCase):
             good=dns_ok and not (one_bad_server and server==p['servers'][-1])
             return {'server':server,'domain':domain,'ok':good,'addresses':['203.0.113.7'] if good else [],'detail':'timeout' if not good else '', 'ms':2}
         def https(domain,ip,timeout): return {'domain':domain,'address':ip,'ok':https_ok,'code':200 if https_ok else 403,'detail':'HTTP 200' if https_ok else 'HTTP 403'}
-        with patch.object(m,'network_fingerprint',return_value='network'),patch.object(m,'dns_query',side_effect=query),patch.object(m,'https_query',side_effect=https),patch.object(m.shutil,'which',return_value='/usr/bin/tool'):
+        with patch.object(m,'network_fingerprint',return_value='network'),patch.object(m,'route_info',return_value={'interface':'test0','gateway':'192.0.2.1'}),patch.object(m,'dns_query',side_effect=query),patch.object(m,'https_query',side_effect=https),patch.object(m.shutil,'which',return_value='/usr/bin/tool'):
             return m.check_provider('magic')
 
     def test_health_green_yellow_red_are_distinct(self):

@@ -17,6 +17,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import dns_diagnostics as probes
 
 ROOT = Path(__file__).resolve().parent
 __version__ = (ROOT / 'VERSION').read_text(encoding='utf-8').strip()
@@ -140,13 +141,66 @@ def validate_config(data):
             commands.add(command)
     if 'provider' not in ids:
         raise ManagerError('Необходим профиль provider для возврата к DNS провайдера.')
-    domains = data.get('test_domains')
-    if not isinstance(domains, list) or not 1 <= len(domains) <= 10 or any(not isinstance(d,str) or not DOMAIN.fullmatch(d) for d in domains):
-        raise ManagerError('Укажите от 1 до 10 доменов для диагностики.')
+    services = diagnostic_services(data)
+    if not 1 <= len(services) <= 20:
+        raise ManagerError('Укажите от 1 до 20 сервисов для диагностики.')
+    ids, hosts = set(), set()
+    for service in services:
+        if not isinstance(service, dict):
+            raise ManagerError('Описание проверяемого сервиса должно быть JSON-объектом.')
+        ident, host, name = service.get('id', ''), service.get('host', ''), service.get('name', '')
+        if not isinstance(ident, str) or not re.fullmatch(r'[a-z][a-z0-9-]{0,39}', ident) or ident in ids:
+            raise ManagerError('ID проверяемого сервиса должен быть уникальным латинским именем.')
+        if not isinstance(host, str) or not DOMAIN.fullmatch(host) or host.lower() in hosts:
+            raise ManagerError('Укажите уникальное DNS-имя сервиса без https:// и пути.')
+        if not isinstance(name, str) or not name.strip() or len(name) > 80 or any(ord(c)<32 for c in name):
+            raise ManagerError('Укажите корректное название проверяемого сервиса.')
+        if service.get('role', 'ai') not in ('ai', 'control'):
+            raise ManagerError('Роль сервиса: ai или control.')
+        ids.add(ident); hosts.add(host.lower())
+    if 'test_services' in data:
+        for service in data['test_services']:
+            service['host'] = service['host'].lower()
+            service.setdefault('role', 'ai')
     for key, maximum in [('dns_timeout', 10), ('https_timeout', 20)]:
         if type(data.get(key)) is not int or not 1 <= data[key] <= maximum:
             raise ManagerError(f'Недопустимый таймаут {key}.')
     return data
+
+
+def diagnostic_services(data):
+    if 'test_services' in data:
+        if not isinstance(data['test_services'], list):
+            raise ManagerError('test_services должен быть списком сервисов.')
+        services = copy.deepcopy(data['test_services'])
+        for service in services:
+            if isinstance(service, dict):
+                service.setdefault('role', 'ai')
+        return services
+    # Read old v1 configurations without changing them automatically.
+    domains = data.get('test_domains')
+    if not isinstance(domains, list) or any(not isinstance(d, str) or not DOMAIN.fullmatch(d) for d in domains):
+        raise ManagerError('Укажите test_services либо список test_domains.')
+    known = {s['host']: s for s in probes.DEFAULT_SERVICES}
+    return [copy.deepcopy(known.get(domain, {'id': 'service-' + str(i), 'name': domain, 'host': domain, 'role': 'control'})) for i,domain in enumerate(domains)]
+
+
+def upgraded_diagnostics_config(data):
+    updated = copy.deepcopy(data)
+    if 'test_services' not in updated:
+        existing = diagnostic_services(data)
+        updated['test_services'] = copy.deepcopy(probes.DEFAULT_SERVICES)
+        hosts = {s['host'] for s in updated['test_services']}
+        for service in existing:
+            if service['host'] not in hosts:
+                updated['test_services'].append(service)
+        updated.pop('test_domains', None)
+    return validate_config(updated)
+
+
+def diagnostics_signature(data):
+    return fingerprint({'version': probes.PROBE_VERSION, 'services': diagnostic_services(data),
+                        'dns_timeout': data['dns_timeout'], 'https_timeout': data['https_timeout']})
 
 
 def load_config():
@@ -344,6 +398,8 @@ def dns_query(p, server, domain, timeout):
     addresses, reason = [], ''
     try:
         body = json.loads(response.stdout)
+        if not isinstance(body, dict):
+            raise ValueError('Некорректный JSON DNS-ответа')
         if response.returncode == 0 and body.get('RCODE') == 0:
             for rr in body.get('answerRRs', []):
                 if rr.get('TYPE') == 1:
@@ -362,36 +418,31 @@ def dns_query(p, server, domain, timeout):
             'addresses': addresses, 'detail': reason, 'ms': round((time.monotonic()-started)*1000)}
 
 
-def https_query(domain, address, timeout):
-    # --resolve supplies this provider's answer, preserving URL hostname, SNI and certificate verification.
-    args = ['curl', '-4', '--noproxy', '*', '--resolve', f'{domain}:443:{address}', '--connect-timeout', str(min(4, timeout)),
-            '--max-time', str(timeout), '-sS', '-o', '/dev/null', '-w', '%{http_code}\t%{time_connect}\t%{time_appconnect}', f'https://{domain}']
-    result = run(args, timeout + 2)
-    parts = result.stdout.split('\t')
-    code = int(parts[0]) if parts and parts[0].isdigit() else 0
-    ok = result.returncode == 0 and 200 <= code < 400
-    if result.returncode:
-        stage = 'DNS/TCP/TLS'
-        if len(parts) > 2:
-            try:
-                stage = 'TCP' if float(parts[1]) == 0 else ('TLS' if float(parts[2]) == 0 else 'HTTP')
-            except ValueError:
-                pass
-        detail = f'{stage}: curl {result.returncode}; {result.stderr.strip()[-350:]}'
-    elif code == 403:
-        detail = 'HTTP 403: сервер ответил, доступ ограничен'
-    else:
-        detail = f'HTTP {code}'
-    return {'domain': domain, 'address': address, 'ok': ok, 'code': code, 'detail': detail}
+def https_query(domain, address, timeout, path='/'):
+    return probes.probe_https(domain, address, timeout, run, path)
 
 
-def check_provider(ident, emit=None):
+def check_provider(ident, emit=None, on_event=None):
     data = load_config()
     p = copy.deepcopy(provider(data, ident))
+    services = diagnostic_services(data)
+    domains = [s['host'] for s in services]
     start_network = network_fingerprint()
     servers = p['servers'] if p['mode'] != 'dhcp' else dhcp_servers()
-    result = {'id': ident, 'name': p['name'], 'tested_servers': servers, 'checked_at': datetime.datetime.now().astimezone().isoformat(timespec='seconds'),
-              'fingerprint': fingerprint(p), 'network': start_network, 'state': 'unknown', 'dns': [], 'https': [], 'issues': []}
+    result = {
+        'id': ident, 'name': p['name'], 'tested_servers': servers,
+        'checked_at': datetime.datetime.now().astimezone().isoformat(timespec='seconds'),
+        'fingerprint': fingerprint(p), 'network': start_network, 'probe_version': probes.PROBE_VERSION,
+        'diagnostics_signature': diagnostics_signature(data), 'state': 'unknown',
+        'dns': [], 'https': [], 'issues': [], 'services': [], 'route': route_info(),
+        'profile': {'mode': p['mode'], 'tls_hostname': p['tls_hostname'], 'port': p['port']},
+    }
+
+    def event(kind, **values):
+        if on_event:
+            on_event({'kind': kind, 'id': ident, 'name': p['name'], **values})
+
+    event('start', services=services, profile=result['profile'], servers=servers, route=result['route'])
     if not shutil.which('kdig') or not shutil.which('curl'):
         result['issues'] = ['Нужны установленные kdig и curl. Проверка не выполнялась.']
     elif not servers:
@@ -401,13 +452,39 @@ def check_provider(ident, emit=None):
         if emit:
             emit(f'{p["name"]}: прямые DNS-запросы ({MODE_NAMES[p["mode"]]}), системный профиль не меняется.')
         with concurrent.futures.ThreadPoolExecutor(max_workers=6) as pool:
-            futures = [pool.submit(dns_query, p, s, d, data['dns_timeout']) for s in servers for d in data['test_domains']]
-            result['dns'] = [f.result() for f in futures]
-            pairs = sorted({(r['domain'],r['addresses'][0]) for r in result['dns'] if r['ok']})
+            futures = [pool.submit(dns_query, p, server, domain, data['dns_timeout']) for server in servers for domain in domains]
+            dns_total = len(futures)
+            for count, future in enumerate(concurrent.futures.as_completed(futures), 1):
+                answer = future.result()
+                result['dns'].append(answer)
+                service = next(s for s in services if s['host'] == answer['domain'])
+                event('service', service=probes.summarize_service(service, result['dns'], [], complete=False),
+                      progress=0.5 * count / dns_total, phase='DNS', completed=count, total=dns_total)
+            pairs = sorted({(r['domain'], r['addresses'][0]) for r in result['dns'] if r['ok']})
+            total_checks = dns_total + len(pairs)
+            for service in services:
+                if not any(domain == service['host'] for domain, ip in pairs):
+                    event('service', service=probes.summarize_service(service, result['dns'], []), progress=dns_total / total_checks, phase='DNS', completed=dns_total, total=dns_total)
             if emit:
-                emit(f'{p["name"]}: проверка HTTPS по полученным адресам, без прокси.')
-            futures = [pool.submit(https_query,d,ip,data['https_timeout']) for d,ip in pairs]
-            result['https'] = [f.result() for f in futures]
+                emit(f'{p["name"]}: TCP, TLS, HTTP и перенаправления через адреса выбранного DNS, без прокси.')
+
+            def resolve_redirect(host, remaining):
+                if not DOMAIN.fullmatch(host):
+                    return []
+                # Independent pool avoids waiting on workers occupied by HTTPS requests.
+                with concurrent.futures.ThreadPoolExecutor(max_workers=min(4, len(servers))) as redirects:
+                    queries = [redirects.submit(dns_query, p, server, host, min(data['dns_timeout'], remaining)) for server in servers]
+                    return [query.result() for query in queries]
+
+            futures = [pool.submit(probes.follow_https, domain, ip, data['https_timeout'], https_query, resolve_redirect) for domain, ip in pairs]
+            for count, future in enumerate(concurrent.futures.as_completed(futures), 1):
+                answer = future.result()
+                result['https'].append(answer)
+                service = next(s for s in services if s['host'] == answer['domain'])
+                expected = sum(domain == service['host'] for domain, ip in pairs)
+                received = sum(r['domain'] == service['host'] for r in result['https'])
+                event('service', service=probes.summarize_service(service, result['dns'], result['https'], complete=received == expected),
+                      progress=(dns_total + count) / total_checks, phase='HTTPS', completed=count, total=len(futures))
         good_dns = sum(item['ok'] for item in result['dns'])
         if not good_dns:
             result['state'] = 'red'
@@ -420,12 +497,23 @@ def check_provider(ident, emit=None):
             if failed:
                 result['issues'].append(f'DNS {server}: нет корректного ответа для ' + ', '.join(failed))
         result['issues'] += [r['domain'] + ': ' + r['detail'] for r in result['https'] if not r['ok']]
+    result['dns'].sort(key=lambda r: (r['domain'], r['server']))
+    result['https'].sort(key=lambda r: (r['domain'], r['address']))
+    result['services'] = [probes.summarize_service(service, result['dns'], result['https']) for service in services]
+    if result['state'] == 'unknown':
+        for service in result['services']:
+            service.update(state='unknown', detail=result['issues'][0], issues=result['issues'])
     if network_fingerprint() != start_network:
         result['state'] = 'yellow' if any(r['ok'] for r in result['dns']) else 'unknown'
         result['issues'].append('Во время проверки изменились интерфейсы или основной маршрут. Повторите проверку.')
         result['network'] = 'changed-during-check'
+        for service in result['services']:
+            service.update(state='unknown', detail='Сеть изменилась во время проверки; результат устарел.')
+    result['summary'] = probes.summary(result)
     cache_health(result)
+    event('finished', result=result, progress=1.0)
     return result
+
 
 
 def cache_health(result):
@@ -461,18 +549,37 @@ def health_results(data=None, network=None):
         except (ValueError, KeyError, TypeError):
             fresh = False
         same_dhcp = p['mode'] != 'dhcp' or item.get('tested_servers') == dhcp_servers()
-        if item.get('fingerprint') == fingerprint(p) and item.get('network') == network and fresh and same_dhcp:
+        if item.get('fingerprint') == fingerprint(p) and item.get('network') == network and fresh and same_dhcp and item.get('diagnostics_signature') == diagnostics_signature(data):
             result[p['id']] = item
     return result
 
 
 def format_health(result):
     states = {'green': '✓ Работает', 'yellow': '⚠ Частично работает', 'red': '✕ Не работает', 'unknown': '— Не проверен'}
+    def ms(value):
+        return f'{value:g} мс' if isinstance(value, (int, float)) else '—'
     lines = [f'{result["name"]}: {states[result["state"]]}', 'Проверено: ' + result['checked_at'], 'Системный DNS не переключался.']
+    route = result.get('route', {})
+    lines.append(f'Маршрут IPv4: {route.get("interface", "—")} через {route.get("gateway", "—")}')
+    summary = result.get('summary', {})
+    if summary:
+        lines.append(f'ИИ-сервисы: {summary["ai_ok"]}/{summary["ai_total"]}; DNS-серверы: {summary["dns_servers_ok"]}/{summary["dns_servers_total"]}')
+        lines.append(f'Медиана DNS: {ms(summary.get("dns_ms"))}; TCP: {ms(summary.get("tcp_ms"))}; HTTPS: {ms(summary.get("https_ms"))}')
+    for service in result.get('services', []):
+        lines.append(f'\n{service["name"]} ({service["host"]}): {states[service["state"]]}')
+        lines.append(f'  DNS {service["dns_ok"]}/{service["dns_total"]} · {ms(service.get("dns_ms"))}; TCP {ms(service.get("tcp_ms"))}; TLS {ms(service.get("tls_ms"))}; HTTPS {ms(service.get("https_ms"))}')
+        lines += ['  ' + issue for issue in service['issues']]
+    lines.append('\nПодробности запросов:')
     for r in result['dns']:
         lines.append(f'  DNS {r["server"]} → {r["domain"]}: ' + (', '.join(r['addresses']) if r['ok'] else r['detail']) + f' ({r["ms"]} мс)')
     for r in result['https']:
         lines.append(f'  HTTPS {r["domain"]} → {r["address"]}: {r["detail"]}')
+        for hop in r.get('hops', []):
+            lines.append(f'    {hop.get("url", "")} → {hop.get("address", "")} · {hop["detail"]}')
+            timing = hop.get('timings', {})
+            lines.append(f'      TCP {ms(timing.get("tcp_ms"))}; TLS {ms(timing.get("tls_ms"))}; первый байт {ms(timing.get("ttfb_ms"))}; всего {ms(timing.get("total_ms"))}')
+        for query in r.get('redirect_dns', []):
+            lines.append(f'    DNS перехода {query["server"]} → {query["domain"]}: ' + (', '.join(query['addresses']) if query['ok'] else query['detail']))
     lines += ['  ' + text for text in result['issues']]
     return '\n'.join(lines) + '\n'
 
@@ -494,7 +601,7 @@ def diagnostic(details=False, emit=print):
     emit('\nПрокси-переменные: ' + ('обнаружены' if any(os.environ.get(k) for k in ['http_proxy','https_proxy','all_proxy','HTTP_PROXY','HTTPS_PROXY','ALL_PROXY']) else 'отсутствуют'))
     if not details:
         data = load_config()
-        for domain in data['test_domains']:
+        for domain in [service['host'] for service in diagnostic_services(data)]:
             r = run(['resolvectl','query',domain], data['dns_timeout'] + 1)
             emit(f'DNS {domain}: ' + ('OK' if r.returncode == 0 else 'ОШИБКА / TIMEOUT'))
             r = run(['curl','-4','--noproxy','*','--connect-timeout','4','--max-time',str(data['https_timeout']),'-sS','-o','/dev/null','-w','%{http_code}',f'https://{domain}'], data['https_timeout']+2)
@@ -512,7 +619,7 @@ def main(argv=None):
     sub.add_parser('details')
     check = sub.add_parser('check'); check.add_argument('id', nargs='?'); check.add_argument('--all', action='store_true'); check.add_argument('--json', action='store_true')
     command = sub.add_parser('command'); command.add_argument('name'); command.add_argument('args', nargs=argparse.REMAINDER)
-    config = sub.add_parser('config'); config.add_argument('operation', choices=['path','show','import','sync-commands']); config.add_argument('file', nargs='?')
+    config = sub.add_parser('config'); config.add_argument('operation', choices=['path','show','import','sync-commands','upgrade-checks']); config.add_argument('file', nargs='?')
     args = parser.parse_args(argv)
     try:
         data = load_config()
@@ -549,6 +656,9 @@ def main(argv=None):
             if args.operation == 'path': print(CONFIG)
             elif args.operation == 'show': print(json.dumps(data, ensure_ascii=False, indent=2))
             elif args.operation == 'sync-commands': install_commands(data)
+            elif args.operation == 'upgrade-checks':
+                save_config(upgraded_diagnostics_config(data))
+                print('Список проверяемых сервисов обновлён. Системный DNS не изменён.')
             elif args.operation == 'import':
                 if not args.file: raise ManagerError('Укажите JSON-файл для импорта.')
                 save_config(json.loads(Path(args.file).read_text()))
