@@ -22,10 +22,10 @@ class TerminalTests(unittest.TestCase):
         sandbox=tempfile.TemporaryDirectory()
         temp=Path(sandbox.name)
         (temp/'providers.json').write_text((root/'providers.default.json').read_text())
-        (temp/'aliases').write_text('_dns_active_connections() { :; }\n')
-        for name,text in [('ip', '[]'), ('resolvectl', 'Global:')]:
+        (temp/'network.bash').write_text("DNS_ETH_UUID='00000000-0000-0000-0000-000000000001'\nDNS_WIFI_UUID='00000000-0000-0000-0000-000000000002'\nDNS_INTERFACES=(eth-test wifi-test)\nDNS_PROFILE_CONF='/tmp/test-resolved-profile.conf'\nDNS_LEGACY_CONFS=()\n")
+        for name,text in [('ip', '[]'), ('resolvectl', 'Global:'), ('nmcli', '')]:
             command=temp/name; command.write_text('#!/bin/sh\nprintf \'%s\\n\' '+repr(text)+'\n'); command.chmod(0o755)
-        child_env={**os.environ,'TERM':'xterm-256color','DNS_MANAGER_CONFIG':str(temp/'providers.json'),'DNS_MANAGER_CACHE':str(temp/'cache'),'DNS_ALIASES_FILE':str(temp/'aliases'),'PATH':str(temp)+':'+os.environ['PATH']}
+        child_env={**os.environ,'TERM':'xterm-256color','DNS_MANAGER_CONFIG':str(temp/'providers.json'),'DNS_MANAGER_CACHE':str(temp/'cache'),'DNS_MANAGER_NETWORK_CONFIG':str(temp/'network.bash'),'PATH':str(temp)+':'+os.environ['PATH']}
         process=subprocess.Popen([str(root/'dns-menu')],stdin=slave,stdout=slave,stderr=slave,env=child_env)
         os.close(slave)
         data=bytearray(); sent=False; deadline=time.monotonic()+15

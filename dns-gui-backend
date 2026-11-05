@@ -1,7 +1,7 @@
 #!/bin/sh
 # Compatibility entry point. All frontends use dnsctl / dns_manager.py.
 SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
-export DNS_ALIASES_FILE="${2:-$HOME/.bash_aliases}"
+# The legacy second argument is accepted for compatibility; runtime does not source ~/.bash_aliases.
 export DNS_MANAGER_GUI=1
 export SUDO_ASKPASS="$SCRIPT_DIR/dns-askpass"
 case "$1" in

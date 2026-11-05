@@ -23,7 +23,10 @@ ROOT = Path(__file__).resolve().parent
 __version__ = (ROOT / 'VERSION').read_text(encoding='utf-8').strip()
 CONFIG = Path(os.environ.get('DNS_MANAGER_CONFIG', str(Path.home() / '.config/dns-manager/providers.json')))
 CACHE = Path(os.environ.get('DNS_MANAGER_CACHE', str(Path.home() / '.cache/dns-manager')))
+# ALIASES is used only by the integration installer, never sourced by runtime commands.
 ALIASES = Path(os.environ.get('DNS_ALIASES_FILE', str(Path.home() / '.bash_aliases')))
+NETWORK_BACKEND = ROOT / 'shell/network.bash'
+NETWORK_CONFIG = Path(os.environ.get('DNS_MANAGER_NETWORK_CONFIG', str(CONFIG.parent / 'network.bash')))
 PROFILE_FILE = Path('/etc/systemd/resolved.conf.d/90-alex-dns-profile.conf')
 MODE_NAMES = {'dhcp': 'DHCP', 'dot': 'DNS over TLS', 'plain': 'DNS · UDP/TCP'}
 DOMAIN = re.compile(r'(?=.{1,253}\Z)(?:[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)*[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\Z')
@@ -286,8 +289,8 @@ def server_tokens(p):
 
 def active_connections():
     # Use the CLI's existing UUID allow-list, never include VPN or inactive profiles.
-    script = 'source "$1"; _dns_active_connections'
-    text = output(['bash', '-c', script, '_', str(ALIASES)])
+    script = 'DNS_MANAGER_NETWORK_CONFIG="$2"; source "$1" || exit 1; _dns_active_connections'
+    text = output(['bash', '-c', script, '_', str(NETWORK_BACKEND), str(NETWORK_CONFIG)])
     result = []
     for line in text.splitlines():
         if '|' not in line:
@@ -354,10 +357,11 @@ def apply_profile(ident, emit=print, gui=False):
     data = load_config()
     p = provider(data, ident)
     with lock(CACHE / 'operation.lock'):
-        script = '''source "$1" || exit 1
+        script = '''DNS_MANAGER_NETWORK_CONFIG="$2"
+source "$1" || exit 1
 if [[ "${DNS_MANAGER_GUI:-0}" == 1 ]]; then sudo() { /usr/bin/sudo -A "$@"; }; fi
-if [[ "$2" == dhcp ]]; then _dns_provider_apply; else _dns_switch "$3" "$4" "$5"; fi'''
-        args = ['bash', '-c', script, '_', str(ALIASES), p['mode'], p['name'], ' '.join(server_tokens(p)), 'yes' if p['mode'] == 'dot' else 'no']
+if [[ "$3" == dhcp ]]; then _dns_provider_apply; else _dns_switch "$4" "$5" "$6"; fi'''
+        args = ['bash', '-c', script, '_', str(NETWORK_BACKEND), str(NETWORK_CONFIG), p['mode'], p['name'], ' '.join(server_tokens(p)), 'yes' if p['mode'] == 'dot' else 'no']
         emit(f'Применяю {p["name"]}. Только активные известные Ethernet/Wi-Fi; без переподключения.')
         # Inherit the terminal for sudo in CLI; GUI uses askpass and streamed output.
         env = {**os.environ, 'DNS_MANAGER_GUI': '1', 'SUDO_ASKPASS': str(ROOT / 'dns-askpass')} if gui else None

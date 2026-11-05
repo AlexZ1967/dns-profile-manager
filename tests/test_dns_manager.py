@@ -141,8 +141,12 @@ class CoreTests(unittest.TestCase):
             self.assertEqual(popen.call_args.kwargs['env']['DNS_MANAGER_GUI'],'1')
 
 
-@unittest.skipUnless(m.ALIASES.exists() and '_dns_nm_configure()' in m.ALIASES.read_text(), 'Existing network helpers not integrated')
+@unittest.skipUnless(m.NETWORK_BACKEND.exists(), 'Project network module not found')
 class ExistingNetworkHelperTests(unittest.TestCase):
+    def settings(self, root):
+        path=root/'network.bash'
+        path.write_text("DNS_ETH_UUID='00000000-0000-0000-0000-000000000001'\nDNS_WIFI_UUID='00000000-0000-0000-0000-000000000002'\nDNS_INTERFACES=(enp5s0 wlp4s0)\nDNS_PROFILE_CONF='"+str(root/'profile.conf')+"'\nDNS_LEGACY_CONFS=('"+str(root/'legacy')+"')\n")
+        return path
     def test_only_known_active_connections_reapplied(self):
         # Execute the real Bash helper with fake nmcli; no sudo or network changes.
         with tempfile.TemporaryDirectory() as tmp:
@@ -158,8 +162,8 @@ if args==['-t','-f','UUID,DEVICE','connection','show','--active']:
 '''); cli.chmod(0o755)
             for active,expected in [(eth+':enp5s0',['enp5s0']),(wifi+':wlp4s0',['wlp4s0']),(eth+':enp5s0\n'+wifi+':wlp4s0',['enp5s0','wlp4s0'])]:
                 log.write_text('')
-                env={**os.environ,'PATH':str(root)+':'+os.environ['PATH'],'CALLS':str(log),'ACTIVE':active+'\nunknown-vpn:tun0\nother-uuid:enp6s0'}
-                result=subprocess.run(['bash','-c','source "$1"; DNS_ETH_UUID="$2"; DNS_WIFI_UUID="$3"; _dns_nm_configure yes','_',str(m.ALIASES),eth,wifi],env=env,capture_output=True,text=True)
+                env={**os.environ,'DNS_MANAGER_NETWORK_CONFIG':str(self.settings(root)),'PATH':str(root)+':'+os.environ['PATH'],'CALLS':str(log),'ACTIVE':active+'\nunknown-vpn:tun0\nother-uuid:enp6s0'}
+                result=subprocess.run(['bash','-c','source "$1"; DNS_ETH_UUID="$2"; DNS_WIFI_UUID="$3"; _dns_nm_configure yes','_',str(m.NETWORK_BACKEND),eth,wifi],env=env,capture_output=True,text=True)
                 self.assertEqual(result.returncode,0,result.stderr)
                 calls=[json.loads(l) for l in log.read_text().splitlines()]
                 reapplied=[c[2] for c in calls if c[:2]==['device','reapply']]
@@ -174,7 +178,7 @@ if args==['-t','-f','UUID,DEVICE','connection','show','--active']:
             root=Path(tmp); binpath=root/'bin'; binpath.mkdir(); calls=root/'calls.jsonl'
             eth='00000000-0000-0000-0000-000000000001'
             dispatcher=root/'dispatcher.lock'; dispatcher.touch()
-            aliases=root/'aliases'; aliases.write_text(m.ALIASES.read_text().replace('/run/lock/nm-dns-primary-route.lock',str(dispatcher)))
+            aliases=root/'aliases'; aliases.write_text(m.NETWORK_BACKEND.read_text().replace('/run/lock/nm-dns-primary-route.lock',str(dispatcher)))
             command_code = r"""#!/usr/bin/python3
 import os,sys,json
 from pathlib import Path
@@ -199,7 +203,7 @@ if name=='sudo':
 """
             for name in ['nmcli','sudo','resolvectl']:
                 path=binpath/name; path.write_text(command_code); path.chmod(0o755)
-            env={**os.environ,'PATH':str(binpath)+':'+os.environ['PATH'],'CALLS':str(calls),'TEST_ROOT':tmp,'ETH':eth}
+            env={**os.environ,'DNS_MANAGER_NETWORK_CONFIG':str(self.settings(root)),'PATH':str(binpath)+':'+os.environ['PATH'],'CALLS':str(calls),'TEST_ROOT':tmp,'ETH':eth}
             prefix='source "$1"; DNS_ETH_UUID="$2"; DNS_PROFILE_CONF="$3"; DNS_LEGACY_CONFS=("$4/legacy"); '
             args=['_',str(aliases),eth,str(root/'profile.conf'),tmp]
             result=subprocess.run(['bash','-c',prefix+'_dns_switch "Fixture" "203.0.113.10#dns.example.org" yes',*args],env=env,capture_output=True,text=True)
