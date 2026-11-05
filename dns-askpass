@@ -1,0 +1,2 @@
+#!/bin/sh
+exec /usr/bin/zenity --password --title='Требуются права администратора для DNS'

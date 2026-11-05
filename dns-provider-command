@@ -1,0 +1,4 @@
+#!/bin/sh
+COMMAND_NAME="$(basename -- "$0")"
+SCRIPT_DIR="$(dirname -- "$(readlink -f -- "$0")")"
+exec "$SCRIPT_DIR/dnsctl" command "$COMMAND_NAME" "$@"

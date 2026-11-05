@@ -1,0 +1,12 @@
+#!/bin/sh
+# Compatibility entry point. All frontends use dnsctl / dns_manager.py.
+SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+export DNS_ALIASES_FILE="${2:-$HOME/.bash_aliases}"
+export DNS_MANAGER_GUI=1
+export SUDO_ASKPASS="$SCRIPT_DIR/dns-askpass"
+case "$1" in
+    detect) exec "$SCRIPT_DIR/dnsctl" current --json ;;
+    run) exec "$SCRIPT_DIR/dnsctl" command "$3" ;;
+    test-all) exec "$SCRIPT_DIR/dnsctl" check --all ;;
+    *) echo 'Использование: dns-gui-backend detect|run|test-all [aliases] [command]' >&2; exit 2 ;;
+esac

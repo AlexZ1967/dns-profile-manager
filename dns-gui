@@ -1,0 +1,4 @@
+#!/bin/sh
+SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+# System Python provides GTK/Pango; Conda's Tk build has no font smoothing.
+exec /usr/bin/python3 "$SCRIPT_DIR/dns-gui.py" "$@"

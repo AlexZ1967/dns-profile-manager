@@ -1,0 +1,3 @@
+#!/bin/sh
+SCRIPT_DIR="$(dirname -- "$(readlink -f -- "$0")")"
+exec /usr/bin/python3 "$SCRIPT_DIR/dns_manager.py" "$@"

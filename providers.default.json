@@ -1,0 +1,13 @@
+{
+  "version": 1,
+  "test_domains": ["chatgpt.com", "github.com", "gemini.google.com"],
+  "dns_timeout": 3,
+  "https_timeout": 8,
+  "providers": [
+    {"id": "provider", "name": "DNS провайдера", "mode": "dhcp", "servers": [], "tls_hostname": "", "port": 53, "command": "dns-provider", "off_commands": [], "website": "", "description": "DNS, полученные по DHCP каждым активным Ethernet/Wi-Fi подключением."},
+    {"id": "magic", "name": "MagicDNS", "mode": "dot", "servers": ["45.88.163.92", "109.120.177.170"], "tls_hostname": "api.magicdns.ru", "port": 853, "command": "dns-magic-on", "off_commands": ["dns-magic-off"], "website": "https://magicdns.ru/", "description": "Действующий профиль CLI. Глобальный DNS over TLS через systemd-resolved."},
+    {"id": "dagami", "name": "Dagami DNS", "mode": "dot", "servers": ["2.56.122.194"], "tls_hostname": "dns.dagami.ru", "port": 853, "command": "dns-dagami-on", "off_commands": ["dns-dagami-off"], "website": "https://dns.dagami.ru/", "description": "Действующий профиль CLI. Глобальный DNS over TLS через systemd-resolved."},
+    {"id": "xbox", "name": "Xbox Smart DNS", "mode": "plain", "servers": ["111.88.96.54", "111.88.96.55"], "tls_hostname": "", "port": 53, "command": "xbox-dns-on", "off_commands": ["xbox-dns-off"], "website": "https://xbox-dns.ru/", "description": "Официальный сайт сообщает о временной недоступности сервиса. Сначала выполните проверку без переключения."},
+    {"id": "ai", "name": "DNS-AI", "mode": "dot", "servers": ["194.87.196.13", "45.151.102.219"], "tls_hostname": "dns.dns-ai.ru", "port": 853, "command": "dns-ai-on", "off_commands": ["dns-ai-off"], "website": "https://dns-ai.ru/", "description": "Официальные адреса DoT. Доступность проверяется из текущей сети; сторонний установщик не запускается."}
+  ]
+}
