@@ -177,7 +177,7 @@ if args==['-t','-f','UUID,DEVICE','connection','show','--active']:
         with tempfile.TemporaryDirectory() as tmp:
             root=Path(tmp); binpath=root/'bin'; binpath.mkdir(); calls=root/'calls.jsonl'
             eth='00000000-0000-0000-0000-000000000001'
-            dispatcher=root/'dispatcher.lock'; dispatcher.touch()
+            dispatcher=root/'dispatcher.lock'  # First use must create the shared lock.
             aliases=root/'aliases'; aliases.write_text(m.NETWORK_BACKEND.read_text().replace('/run/lock/nm-dns-primary-route.lock',str(dispatcher)))
             command_code = r"""#!/usr/bin/python3
 import os,sys,json
@@ -187,21 +187,23 @@ args=sys.argv[1:]
 with open(os.environ['CALLS'],'a') as f:f.write(json.dumps([name,*args])+'\n')
 if name=='nmcli' and args==['-t','-f','UUID,DEVICE','connection','show','--active']:
  print(os.environ['ETH']+':enp5s0')
+if name=='nmcli' and args==['-t','--escape','no','-f','UUID,TYPE,DEVICE','connection','show','--active']:
+ print(os.environ['ETH']+':802-3-ethernet:enp5s0')
 if name=='sudo':
- if args==['-v']:sys.exit(0)
- if args[:2]==['mkdir','-p']:
-  assert args[2]=='/etc/systemd/resolved.conf.d';sys.exit(0)
- if args[0]=='systemctl':
-  assert args==['systemctl','restart','systemd-resolved'];sys.exit(0)
- if args[0]=='resolvectl':
-  assert args==['resolvectl','flush-caches'];sys.exit(0)
- assert args[0] in ['tee','chmod','mv','rm']
- for arg in args[1:]:
+ assert args[0]=='/usr/bin/bash',args
+ if os.environ.get('AUTH_FAIL')=='1':sys.exit(1)
+ # Execute without elevation; every system-changing command is a fixture below.
+ os.execv(args[0],args)
+if name=='systemctl':
+ assert args==['restart','systemd-resolved'];sys.exit(0)
+if name=='resolvectl':sys.exit(0)
+if name in ['mkdir','chmod','mv','rm']:
+ for arg in args:
   if arg.startswith('/'):
-   assert arg.startswith(os.environ['TEST_ROOT']+'/'),arg
- os.execv('/usr/bin/'+args[0],args)
+   assert arg == os.environ['TEST_ROOT'] or arg.startswith(os.environ['TEST_ROOT']+'/'),arg
+ os.execv('/usr/bin/'+name,[name,*args])
 """
-            for name in ['nmcli','sudo','resolvectl']:
+            for name in ['nmcli','sudo','resolvectl','mkdir','chmod','mv','rm','systemctl']:
                 path=binpath/name; path.write_text(command_code); path.chmod(0o755)
             env={**os.environ,'DNS_MANAGER_NETWORK_CONFIG':str(self.settings(root)),'PATH':str(binpath)+':'+os.environ['PATH'],'CALLS':str(calls),'TEST_ROOT':tmp,'ETH':eth}
             prefix='source "$1"; DNS_ETH_UUID="$2"; DNS_PROFILE_CONF="$3"; DNS_LEGACY_CONFS=("$4/legacy"); '
@@ -212,14 +214,95 @@ if name=='sudo':
             self.assertIn('DNS=203.0.113.10#dns.example.org',content)
             self.assertIn('DNSOverTLS=yes',content)
             self.assertIn('Domains=~.',content)
-            self.assertFalse((root/'profile.conf.new').exists())
+            self.assertFalse(list(root.glob('profile.conf.*')))
             result=subprocess.run(['bash','-c',prefix+'_dns_provider_apply',*args],env=env,capture_output=True,text=True)
             self.assertEqual(result.returncode,0,result.stderr)
             self.assertFalse((root/'profile.conf').exists())
+            self.assertTrue(dispatcher.is_file())
+            self.assertEqual(dispatcher.stat().st_mode & 0o777,0o644)
             entries=[json.loads(line) for line in calls.read_text().splitlines()]
             self.assertFalse(any('NetworkManager' in e or 'down' in e or 'up' in e for e in entries))
             changes=[e for e in entries if e[:3]==['nmcli','connection','modify']]
             self.assertEqual([e[5] for e in changes],['yes','no'])
+            authorizations=[e for e in entries if e[0]=='sudo']
+            self.assertEqual(len(authorizations),2)  # One each for manual DNS and DHCP.
+            self.assertTrue(all(e[1]=='/usr/bin/bash' for e in authorizations))
+            self.assertEqual(sum(e[:2]==['systemctl','restart'] for e in entries),2)
+            # Cancelling the only authorization must prevent all system mutations.
+            calls.write_text('')
+            result=subprocess.run(['bash','-c',prefix+'_dns_switch "Fixture" "203.0.113.10#dns.example.org" yes',*args],env={**env,'AUTH_FAIL':'1'},capture_output=True,text=True)
+            self.assertNotEqual(result.returncode,0)
+            self.assertFalse((root/'profile.conf').exists())
+            cancelled=[json.loads(line) for line in calls.read_text().splitlines()]
+            self.assertEqual(sum(e[0]=='sudo' for e in cancelled),1)
+            self.assertFalse(any(e[0] in ('mkdir','chmod','mv','rm','systemctl') or e[:3]==['nmcli','connection','modify'] for e in cancelled))
+            # New installations use a variable-length physical connection array.
+            # Literal shell syntax in a display name must never become executable.
+            calls.write_text('')
+            malicious_name='Fixture $(touch '+str(root/'unexpected-command')+')'
+            command=prefix+'DNS_CONNECTIONS=("$2||802-3-ethernet"); _dns_switch "$5" "203.0.113.10#dns.example.org" yes'
+            result=subprocess.run(['bash','-c',command,*args,malicious_name],env=env,capture_output=True,text=True)
+            self.assertEqual(result.returncode,0,result.stderr)
+            self.assertFalse((root/'unexpected-command').exists())
+            self.assertIn('DNS=203.0.113.10#dns.example.org',(root/'profile.conf').read_text())
+            serialized=[json.loads(line) for line in calls.read_text().splitlines()]
+            self.assertEqual(sum(e[0]=='sudo' for e in serialized),1)
+
+    def test_failed_networkmanager_apply_restores_previous_profile(self):
+        # A failed nmcli connection modify triggers the rollback: previous
+        # resolved profile text and per-connection DNS fields are restored.
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp); binpath=root/'bin'; binpath.mkdir(); calls=root/'calls.jsonl'
+            eth='00000000-0000-0000-0000-000000000001'
+            dispatcher=root/'dispatcher.lock'; dispatcher.touch()
+            profile=root/'profile.conf'; profile.write_text('# Manual DNS=192.0.2.9\n')
+            legacy=root/'legacy'; legacy.write_text('legacy')
+            aliases=root/'aliases'; aliases.write_text(m.NETWORK_BACKEND.read_text().replace('/run/lock/nm-dns-primary-route.lock',str(dispatcher)))
+            command_code = r"""#!/usr/bin/python3
+import os,sys,json
+from pathlib import Path
+name=Path(sys.argv[0]).name
+args=sys.argv[1:]
+with open(os.environ['CALLS'],'a') as f:f.write(json.dumps([name,*args])+'\n')
+if name=='nmcli' and args==['-t','-f','UUID,DEVICE','connection','show','--active']:
+    print(os.environ['ETH']+':enp5s0')
+if name=='nmcli' and args==['-t','--escape','no','-f','UUID,TYPE,DEVICE','connection','show','--active']:
+    print(os.environ['ETH']+':802-3-ethernet:enp5s0')
+if name=='nmcli' and 'modify' in args and 'yes' in args and os.environ.get('MODIFY_FAIL')=='1':
+    print('Fixture: connection modify failed',file=sys.stderr);sys.exit(2)
+if name=='sudo':
+    assert args[0]=='/usr/bin/bash',args
+    # Execute without elevation; every system-changing command is a fixture below.
+    os.execv(args[0],args)
+if name=='systemctl':
+    assert args==['restart','systemd-resolved'];sys.exit(0)
+if name=='resolvectl':sys.exit(0)
+if name in ['mkdir','chmod','mv','rm']:
+    for arg in args:
+        if arg.startswith('/'):
+            assert arg == os.environ['TEST_ROOT'] or arg.startswith(os.environ['TEST_ROOT']+'/'),arg
+    os.execv('/usr/bin/'+name,[name,*args])
+"""
+            for name in ['nmcli','sudo','resolvectl','mkdir','chmod','mv','rm','systemctl']:
+                path=binpath/name; path.write_text(command_code); path.chmod(0o755)
+            env={**os.environ,'DNS_MANAGER_NETWORK_CONFIG':str(self.settings(root)),'PATH':str(binpath)+':'+os.environ['PATH'],'CALLS':str(calls),'TEST_ROOT':str(root),'ETH':eth,'MODIFY_FAIL':'1'}
+            prefix='source "$1"; DNS_ETH_UUID="$2"; DNS_PROFILE_CONF="$3"; DNS_LEGACY_CONFS=("$4"); '
+            args=['_',str(aliases),eth,str(profile),str(legacy)]
+            result=subprocess.run(['bash','-c',prefix+'_dns_switch "Fixture" "203.0.113.10#dns.example.org" yes',*args],env=env,capture_output=True,text=True)
+            self.assertNotEqual(result.returncode,0)
+            # The previous profile text is restored verbatim; no staged leftovers.
+            self.assertEqual(profile.read_text(),'# Manual DNS=192.0.2.9\n')
+            self.assertFalse(list(root.glob('profile.conf.*')))
+            # Restored per-connection fields use the captured values (ignore-auto-dns no).
+            entries=[json.loads(line) for line in calls.read_text().splitlines()]
+            restores=[e for e in entries if e[:3]==['nmcli','connection','modify'] and 'yes' not in e]
+            self.assertEqual(len(restores),1)
+            self.assertIn('no',restores[0])
+            self.assertEqual(sum(e[:3]==['nmcli','device','reapply'] and e[3]=='enp5s0' for e in entries),1)
+            # Rollback restarts resolved so the restored configuration takes effect.
+            self.assertEqual(sum(e[:2]==['systemctl','restart'] for e in entries),1)
+            # Known limitation: legacy confs removed during the failed run are not restored.
+            self.assertFalse(legacy.exists())
 
 
 if __name__=='__main__': unittest.main()

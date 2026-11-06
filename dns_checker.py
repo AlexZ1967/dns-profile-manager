@@ -6,6 +6,8 @@ gi.require_version('Gdk', '3.0')
 from gi.repository import Gdk, GLib, Gtk, Pango
 import dns_manager as manager
 
+ms = manager.ms
+
 CSS = b'''
 window.gateway-checker { background: #0a1221; color: #ecf3ff; }
 .gateway-checker label { color: #e7effd; }
@@ -52,10 +54,6 @@ def column(spacing=0, css=None):
     return widget
 
 
-def ms(value):
-    return f'{value:g} мс' if isinstance(value, (int, float)) else '—'
-
-
 class GatewayChecker(Gtk.Window):
     def __init__(self, parent, repeat):
         super().__init__(title='Проверка DNS-профиля и ИИ-сервисов', transient_for=parent)
@@ -68,6 +66,7 @@ class GatewayChecker(Gtk.Window):
         provider.load_from_data(CSS)
         Gtk.StyleContext.add_provider_for_screen(Gdk.Screen.get_default(), provider, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
         self.repeat = repeat
+        self.owner = parent
         self.busy = False
         self.failed = False
         self.results = {}
@@ -92,6 +91,10 @@ class GatewayChecker(Gtk.Window):
         self.selector = Gtk.ComboBoxText()
         self.selector.connect('changed', lambda _: self.render())
         toolbar.pack_start(self.selector, True, True, 0)
+        self.stop = Gtk.Button(label='Отмена')
+        self.stop.set_sensitive(False)
+        self.stop.connect('clicked', lambda _: self.owner.cancel_check() if self.owner else None)
+        toolbar.pack_start(self.stop, False, False, 0)
         self.retry = Gtk.Button(label='Проверить профиль')
         self.retry.get_style_context().add_class('check-again')
         self.retry.connect('clicked', lambda _: self.repeat(self.selector.get_active_id()))
@@ -218,6 +221,7 @@ class GatewayChecker(Gtk.Window):
         self.busy = True
         self.failed = False
         self.partials = {}
+        self.stop.set_sensitive(True)
         self.retry.set_sensitive(False)
         self.bar.set_fraction(0)
         self.phase.set_text('Подготовка DNS-запросов…')
@@ -246,16 +250,21 @@ class GatewayChecker(Gtk.Window):
         self.partials.pop(result['id'], None)
         self.render()
 
-    def finish(self, error=False):
+    def finish(self, error=False, cancelled=False):
         self.busy = False
         self.failed = error
-        if error:
+        if error or cancelled:
             self.partials = {}
         self.retry.set_sensitive(True)
+        self.stop.set_sensitive(False)
         self.retry.set_label('Проверить снова')
-        if not error:
-            self.bar.set_fraction(1)
-        self.phase.set_text('Проверка завершена' if not error else 'Проверка прервана ошибкой — см. отчёт основного окна')
+        if cancelled:
+            self.bar.set_fraction(0)
+            self.phase.set_text('Проверка отменена')
+        else:
+            if not error:
+                self.bar.set_fraction(1)
+            self.phase.set_text('Проверка завершена' if not error else 'Проверка прервана ошибкой — см. отчёт основного окна')
         self.render()
 
     def render(self):

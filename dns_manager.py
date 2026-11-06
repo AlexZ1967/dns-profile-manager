@@ -143,8 +143,8 @@ def validate_config(data):
         if ident == 'provider' and p['command'] != 'dns-provider':
             raise ManagerError('CLI-команда DHCP-профиля должна оставаться dns-provider.')
         aliases = p.get('off_commands', [])
-        if not isinstance(aliases, list):
-            raise ManagerError('off_commands должен быть списком.')
+        if not isinstance(aliases, list) or len(aliases) > 20:
+            raise ManagerError('off_commands должен быть списком не длиннее 20 команд.')
         for command in [p['command'], *aliases]:
             if not isinstance(command, str) or not re.fullmatch(r'(?:dns-|xbox-dns-)[a-z0-9-]+', command):
                 raise ManagerError('CLI-команда должна начинаться с dns- или xbox-dns- и содержать латинские буквы, цифры и дефисы.')
@@ -229,6 +229,16 @@ def provider(data, ident):
     raise ManagerError(f'Неизвестный провайдер: {ident}')
 
 
+def command_routes(data, root=None):
+    """Bash function definitions that route CLI command names through dnsctl."""
+    ctl = root or ROOT
+    lines = ['# Generated DNS Manager command routing. Provider settings live in providers.json.']
+    for command, args in command_map(data).items():
+        lines.append(f'{command}() {{ {shlex.quote(str(Path(ctl) / "dnsctl"))} ' + ' '.join(shlex.quote(a) for a in args) + ' "$@"; }')
+    lines.append('dnsctl() { ' + shlex.quote(str(Path(ctl) / 'dnsctl')) + ' "$@"; }')
+    return lines
+
+
 def command_map(data):
     result = {'dns-status': ('status',), 'dns-details': ('details',), 'dns-check': ('check',)}
     for p in data['providers']:
@@ -248,11 +258,7 @@ def check_command_paths(data):
 
 def install_commands(data):
     check_command_paths(data)
-    lines = ['# Generated DNS Manager command routing. Provider settings live in providers.json.']
-    for command, args in command_map(data).items():
-        lines.append(f'{command}() {{ {shlex.quote(str(ROOT / "dnsctl"))} ' + ' '.join(shlex.quote(a) for a in args) + ' "$@"; }')
-    lines.append('dnsctl() { ' + shlex.quote(str(ROOT / 'dnsctl')) + ' "$@"; }')
-    atomic_write(CONFIG.parent / 'commands.bash', '\n'.join(lines) + '\n')
+    atomic_write(CONFIG.parent / 'commands.bash', '\n'.join(command_routes(data)) + '\n')
     local_bin = Path.home() / '.local/bin'
     local_bin.mkdir(parents=True, exist_ok=True)
     wanted = {'dnsctl', *command_map(data)}
@@ -283,6 +289,11 @@ def save_config(data, install=True, expected_hash=None):
 
 def fingerprint(data):
     return hashlib.sha256(json.dumps(data, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
+
+
+def ms(value):
+    """Milliseconds formatting shared by CLI reports and GUI metrics."""
+    return f'{value:g} мс' if isinstance(value, (int, float)) else '—'
 
 
 def server_tokens(p):
@@ -398,9 +409,15 @@ if [[ "$3" == dhcp ]]; then _dns_provider_apply; else _dns_switch "$4" "$5" "$6"
         code = process.wait()
         if code:
             raise ManagerError(f'Переключение завершилось с ошибкой {code}. Проверьте фактический статус.')
-        state = current_state(data)
-        if state['id'] != ident or not state['config_matches'] or not state['effective_matches']:
-            raise ManagerError('Команды выполнены, но фактический DNS не совпадает с выбранным профилем. Откройте диагностику.')
+        try:
+            state = current_state(data)
+            if state['id'] != ident or not state['config_matches'] or not state['effective_matches']:
+                raise ManagerError('Команды выполнены, но фактический DNS не совпадает с выбранным профилем. Откройте диагностику.')
+        except ManagerError as exc:
+            if 'фактический DNS не совпадает' in str(exc):
+                raise
+            # The switch succeeded; reading the state failed (nmcli/polkit/resolved output).
+            raise ManagerError('Команды выполнены, но сверка состояния не удалась: ' + str(exc) + ' Откройте «Статус DNS», чтобы проверить фактический профиль.') from exc
         emit(f'Выбран профиль: {p["name"]}. Работоспособность DNS проверяется отдельно.')
         return state
 
@@ -453,7 +470,17 @@ def https_query(domain, address, timeout, path='/'):
     return probes.probe_https(domain, address, timeout, run, path)
 
 
-def check_provider(ident, emit=None, on_event=None):
+def check_provider(ident, emit=None, on_event=None, should_stop=None):
+    """Checks take the shared user lock: two instances must not run checks concurrently."""
+    with lock(CACHE / 'operation.lock'):
+        result = _check_provider(ident, emit, on_event, should_stop)
+        # network_fingerprint recheck detects changes made while another operation waited.
+        return result
+
+
+def _check_provider(ident, emit=None, on_event=None, should_stop=None):
+    def stopped():
+        return bool(should_stop and should_stop())
     data = load_config()
     p = copy.deepcopy(provider(data, ident))
     services = diagnostic_services(data)
@@ -474,6 +501,8 @@ def check_provider(ident, emit=None, on_event=None):
             on_event({'kind': kind, 'id': ident, 'name': p['name'], **values})
 
     event('start', services=services, profile=result['profile'], servers=servers, route=result['route'])
+    if stopped():
+        raise ManagerError('Проверка отменена до первого запроса.')
     if not shutil.which('kdig') or not shutil.which('curl'):
         result['issues'] = ['Нужны установленные kdig и curl. Проверка не выполнялась.']
     elif not servers:
@@ -491,6 +520,8 @@ def check_provider(ident, emit=None, on_event=None):
                 service = next(s for s in services if s['host'] == answer['domain'])
                 event('service', service=probes.summarize_service(service, result['dns'], [], complete=False),
                       progress=0.5 * count / dns_total, phase='DNS', completed=count, total=dns_total)
+                if stopped():
+                    raise ManagerError('Проверка отменена во время DNS-запросов.')
             pairs = sorted({(r['domain'], r['addresses'][0]) for r in result['dns'] if r['ok']})
             total_checks = dns_total + len(pairs)
             for service in services:
@@ -516,6 +547,8 @@ def check_provider(ident, emit=None, on_event=None):
                 received = sum(r['domain'] == service['host'] for r in result['https'])
                 event('service', service=probes.summarize_service(service, result['dns'], result['https'], complete=received == expected),
                       progress=(dns_total + count) / total_checks, phase='HTTPS', completed=count, total=len(futures))
+                if stopped():
+                    raise ManagerError('Проверка отменена во время HTTPS-проверок.')
         good_dns = sum(item['ok'] for item in result['dns'])
         if not good_dns:
             result['state'] = 'red'
@@ -587,8 +620,6 @@ def health_results(data=None, network=None):
 
 def format_health(result):
     states = {'green': '✓ Работает', 'yellow': '⚠ Частично работает', 'red': '✕ Не работает', 'unknown': '— Не проверен'}
-    def ms(value):
-        return f'{value:g} мс' if isinstance(value, (int, float)) else '—'
     lines = [f'{result["name"]}: {states[result["state"]]}', 'Проверено: ' + result['checked_at'], 'Системный DNS не переключался.']
     route = result.get('route', {})
     lines.append(f'Маршрут IPv4: {route.get("interface", "—")} через {route.get("gateway", "—")}')
@@ -615,9 +646,13 @@ def format_health(result):
     return '\n'.join(lines) + '\n'
 
 
-def diagnostic(details=False, emit=print):
+def diagnostic(details=False, emit=print, should_stop=None):
+    def stopped():
+        return bool(should_stop and should_stop())
     state = current_state()
     emit(f'Профиль DNS: {state["name"]}')
+    if stopped():
+        raise ManagerError('Операция отменена.')
     emit(f'Основной маршрут: {state["route"]["interface"]} через {state["route"]["gateway"]}')
     commands = [(['ip','-4','route','show','default'], 'Маршруты'),
                 (['nmcli','-f','NAME,UUID,TYPE,DEVICE','connection','show','--active'], 'Активные подключения'),
@@ -626,13 +661,19 @@ def diagnostic(details=False, emit=print):
         commands += [(['nmcli','device','show'], 'Устройства NetworkManager'),
                      (['systemd-analyze','cat-config','systemd/resolved.conf'], 'Эффективная конфигурация resolved')]
     for args, title in commands:
+        if stopped():
+            raise ManagerError('Операция отменена.')
         emit('\n=== ' + title + ' ===')
         r = run(args)
         emit(r.stdout.strip() or r.stderr.strip())
+    if stopped():
+        raise ManagerError('Операция отменена.')
     emit('\nПрокси-переменные: ' + ('обнаружены' if any(os.environ.get(k) for k in ['http_proxy','https_proxy','all_proxy','HTTP_PROXY','HTTPS_PROXY','ALL_PROXY']) else 'отсутствуют'))
     if not details:
         data = load_config()
         for domain in [service['host'] for service in diagnostic_services(data)]:
+            if stopped():
+                raise ManagerError('Операция отменена.')
             r = run(['resolvectl','query',domain], data['dns_timeout'] + 1)
             emit(f'DNS {domain}: ' + ('OK' if r.returncode == 0 else 'ОШИБКА / TIMEOUT'))
             r = run(['curl','-4','--noproxy','*','--connect-timeout','4','--max-time',str(data['https_timeout']),'-sS','-o','/dev/null','-w','%{http_code}',f'https://{domain}'], data['https_timeout']+2)

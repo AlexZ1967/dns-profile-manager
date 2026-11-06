@@ -7,7 +7,7 @@ import sys
 import gi
 gi.require_version("Gtk", "3.0")
 gi.require_version("Gdk", "3.0")
-from gi.repository import Gdk, GLib, Gtk, Pango
+from gi.repository import Gdk, Gio, GLib, Gtk, Pango
 import dns_manager as manager
 from dns_checker import GatewayChecker
 
@@ -174,6 +174,9 @@ class DnsGui(Gtk.Window):
         self.checker = None
         self.operation = None
         self.operation_results = []
+        self.cancel_event = threading.Event()
+        self._pending_report = []
+        self._flush_scheduled = None
         self.current = {}
         self.selected_id = self.data['providers'][0]['id']
         self.initial_selection = True
@@ -181,10 +184,13 @@ class DnsGui(Gtk.Window):
         self.controls = []
         self.health = {}
         self.badges = {}
+        self._health_signature = None
         self._style(); self._build()
         self.connect('delete-event', self._close)
         self.refresh_profile()
-        GLib.timeout_add_seconds(5, self._watch_config)
+        self._setup_config_watch()
+        # Slow periodic refresh: network changes (DHCP DNS, primary route) are not file changes.
+        GLib.timeout_add_seconds(20, self._watch_state)
 
     def _style(self):
         settings = Gtk.Settings.get_default()
@@ -254,7 +260,7 @@ class DnsGui(Gtk.Window):
         diagnostics = box(Gtk.Orientation.HORIZONTAL,8)
         diagnostics.add(self._button('Проверить все',self.check_all))
         diagnostics.add(self._button('Статус DNS',lambda _:self._start_task('Получаю статус DNS…','status')))
-        diagnostics.add(self._button('К провайдеру',lambda _:self._apply('provider')))
+        diagnostics.add(self._button('DNS от провайдера (DHCP)',lambda _:self._apply('provider')))
         main.pack_start(diagnostics,False,False,0)
 
         report_card = box(css='report-card')
@@ -310,10 +316,13 @@ class DnsGui(Gtk.Window):
         state = item['state'] if item else 'unknown'
         icon,color,text = HEALTH[state]
         issue = ('; '.join(item['issues'][:3]) if item and item['issues'] else 'DNS и HTTPS отвечают' if state=='green' else 'Запустите проверку: системный DNS не изменится.')
-        self.health_label.set_markup(f'<span foreground="{color}"><b>{icon} {text}</b></span>')
         self.health_label.set_tooltip_text(issue)
         visible_issue = issue if len(issue) <= 180 else issue[:177] + '…'
-        if item: self.health_label.set_markup(self.health_label.get_label()+'\n'+GLib.markup_escape_text(visible_issue))
+        markup = f'<span foreground="{color}"><b>{GLib.markup_escape_text(icon)} {GLib.markup_escape_text(text)}</b>'
+        if item:
+            markup += '\n' + GLib.markup_escape_text(visible_issue)
+        markup += '</span>'
+        self.health_label.set_markup(markup)
 
     def _update_badges(self):
         for ident,badge in self.badges.items():
@@ -321,7 +330,13 @@ class DnsGui(Gtk.Window):
             icon,color,text = HEALTH[item['state'] if item else 'unknown']
             badge.set_markup(f'<span foreground="{color}" size="large"><b>{icon}</b></span>')
             badge.set_tooltip_text(text + ('\n'+ '\n'.join(item['issues']) + '\n' + item['checked_at'] if item else '\nПроверка ещё не выполнена или устарела.'))
-        if hasattr(self,'health_label'): self._update_detail()
+        # The detail card rerenders only when checked results or the active profile changed;
+        # selection changes call _update_detail directly.
+        signature = ([(ident, item.get('state'), item.get('checked_at')) for ident, item in sorted(self.health.items())],
+                     (self.current.get('id'), self.current.get('config_matches'), self.current.get('effective_matches')))
+        if signature != self._health_signature:
+            self._health_signature = signature
+            if hasattr(self,'health_label'): self._update_detail()
 
     def _set_status(self,text,state=None):
         self.status.set_text(text)
@@ -369,7 +384,30 @@ class DnsGui(Gtk.Window):
                 self.checker.configure(data, health, view, state)
         return False
 
-    def _watch_config(self):
+    def _setup_config_watch(self):
+        """Providers/network file changes replace the previous 5-second polling."""
+        self._config_pending = False
+        monitor = None
+        try:
+            directory = Gio.File.new_for_path(str(manager.CONFIG.parent))
+            monitor = directory.monitor_directory(Gio.FileMonitorFlags.NONE)
+            monitor.connect('changed', self._on_config_activity)
+        except (OSError, GLib.Error):
+            monitor = None
+        self._config_monitor = monitor
+
+    def _on_config_activity(self,*_):
+        if self.busy or self._config_pending: return None
+        self._config_pending = True
+        GLib.timeout_add(GLib.PRIORITY_DEFAULT_IDLE,800,self._config_refresh_timeout)
+        return None
+
+    def _config_refresh_timeout(self):
+        self._config_pending = False
+        if not self.busy: self.refresh_profile()
+        return False
+
+    def _watch_state(self):
         if not self.busy: self.refresh_profile()
         return True
 
@@ -382,7 +420,8 @@ class DnsGui(Gtk.Window):
 
     def _apply(self,ident):
         p=manager.provider(self.data,ident)
-        if self._confirm('Подключить '+p['name']+'?', 'Будут использованы активные Ethernet/Wi-Fi из CLI. Маршрут выбирает NetworkManager. Потребуется авторизация администратора.'):
+        title = 'Получать DNS от провайдера по DHCP?' if ident == 'provider' else 'Подключить '+p['name']+'?'
+        if self._confirm(title, 'Будут изменены DNS только активных Ethernet/Wi-Fi подключений. Маршрут выбирает NetworkManager. Потребуется авторизация администратора.'):
             self._start_task('Подключаю '+p['name']+'…','apply',ident)
 
     def check_selected(self,_button):
@@ -411,7 +450,7 @@ class DnsGui(Gtk.Window):
                 d.error.set_markup('<span foreground="#bc3f42">'+GLib.markup_escape_text(str(exc))+'</span>')
         d.destroy()
 
-    def _show_progress(self,title):
+    def _show_progress(self,title,cancellable=False):
         self.progress=Gtk.Dialog(title='Выполняется операция',transient_for=self,modal=True,destroy_with_parent=True)
         self.progress.set_resizable(False); self.progress.set_default_size(440,-1)
         self.progress.set_position(Gtk.WindowPosition.CENTER_ON_PARENT)
@@ -419,7 +458,14 @@ class DnsGui(Gtk.Window):
         content=self.progress.get_content_area(); margins(content,28); content.set_spacing(16)
         spinner=Gtk.Spinner(); spinner.set_size_request(32,32); spinner.set_halign(Gtk.Align.CENTER); spinner.start(); content.add(spinner)
         self.progress_label=label(title,'progress-title'); self.progress_label.set_line_wrap(True); self.progress_label.set_max_width_chars(40); content.add(self.progress_label)
-        content.add(label('Результат появится в отчёте','muted')); self.progress.show_all()
+        content.add(label('Результат появится в отчёте','muted'))
+        if cancellable:
+            cancel=Gtk.Button(label='Отмена')
+            cancel.set_halign(Gtk.Align.CENTER)
+            cancel.connect('clicked',self._cancel_clicked)
+            content.add(cancel)
+            self.progress_cancel=cancel
+        self.progress.show_all()
 
     def open_checker(self, selected=None):
         if self.checker is None:
@@ -442,35 +488,77 @@ class DnsGui(Gtk.Window):
             self.open_checker(ident or self.selected_id)
         self.operation = operation
         self.operation_results = []
+        self.cancel_event.clear()
         self.busy=True; self.refresh_generation+=1; self.buffer.set_text(''); self._set_status(title)
         for c in self.controls: c.set_sensitive(False)
         self.profile_list.set_sensitive(False)
         if checking:
             self.checker.start()
         else:
-            self._show_progress(title)
-        def emit(text): GLib.idle_add(self._receive_line,text)
+            # Switching DNS is one short privileged operation; it must not be interrupted.
+            self._show_progress(title,operation in ('status','details'))
+        def emit(text): GLib.idle_add(GLib.PRIORITY_DEFAULT_IDLE,self._receive_line,text)
         def worker():
             code=0
             try:
                 if operation=='apply': manager.apply_profile(ident,emit,gui=True)
-                elif operation in ('status','details'): manager.diagnostic(operation=='details',emit)
+                elif operation in ('status','details'): manager.diagnostic(operation=='details',emit,self.cancel_event.is_set)
                 else:
                     ids=[p['id'] for p in manager.load_config()['providers']] if operation=='check-all' else [ident]
                     for index, item in enumerate(ids):
+                        if self.cancel_event.is_set():
+                            emit('Операция отменена: следующие профили не проверялись.')
+                            break
                         def event(packet, index=index):
                             packet = dict(packet, overall_progress=(index + packet.get('progress', 0)) / len(ids), batch_index=index+1, batch_total=len(ids))
-                            GLib.idle_add(self._checker_event, packet)
-                        result=manager.check_provider(item,emit,on_event=event)
-                        GLib.idle_add(self._receive_health,result)
+                            GLib.idle_add(GLib.PRIORITY_DEFAULT_IDLE,self._checker_event, packet)
+                        try:
+                            result=manager.check_provider(item,emit,on_event=event,should_stop=self.cancel_event.is_set)
+                        except Exception as exc:
+                            if self.cancel_event.is_set():
+                                emit('Проверка '+item+' отменена.')
+                            else:
+                                code=1; emit('Ошибка: '+str(exc))
+                            continue
+                        GLib.idle_add(GLib.PRIORITY_DEFAULT_IDLE,self._receive_health,result)
             except Exception as exc:
-                code=1; emit('Ошибка: '+str(exc))
-            GLib.idle_add(self._finish,code)
+                if self.cancel_event.is_set():
+                    emit('Операция отменена.')
+                else:
+                    code=1; emit('Ошибка: '+str(exc))
+            GLib.idle_add(GLib.PRIORITY_DEFAULT_IDLE,self._finish,code)
         threading.Thread(target=worker,daemon=True).start()
 
+    def _cancel_clicked(self,_button):
+        if not self.can_cancel(): return
+        self.cancel_event.set()
+        if self.progress:
+            self.progress_label.set_text('Отмена запрошена: текущий этап завершится, новые не начнутся.')
+        if getattr(self,'progress_cancel',None):
+            self.progress_cancel.set_sensitive(False)
+
+    def cancel_check(self):
+        """Cancel hook for the GatewayChecker panel (check / check-all)."""
+        if not self.can_cancel(): return
+        self.cancel_event.set()
+
+    def can_cancel(self):
+        return self.busy and self.operation in ('status','details','check','check-all')
+
     def _receive_line(self,text):
-        self.buffer.insert(self.buffer.get_end_iter(),text+'\n')
-        if self.progress: self.progress_label.set_text(text[-250:])
+        if self.progress and self.progress_label:
+            self.progress_label.set_text(text[-250:])
+        self._pending_report.append(text)
+        if not self._flush_scheduled:
+            self._flush_scheduled=GLib.timeout_add(GLib.PRIORITY_DEFAULT_IDLE,150,self._flush_report)
+        return False
+
+    def _flush_report(self):
+        self._flush_scheduled=None
+        if self._pending_report:
+            text='\n'.join(self._pending_report)
+            self._pending_report=[]
+            self.buffer.insert(self.buffer.get_end_iter(),text+'\n')
         return False
 
     def _receive_health(self,result):
@@ -480,13 +568,19 @@ class DnsGui(Gtk.Window):
         self._update_badges(); return False
 
     def _finish(self,code):
+        if self._flush_scheduled:
+            GLib.source_remove(self._flush_scheduled); self._flush_scheduled=None
+        self._flush_report()
+        cancelled=self.cancel_event.is_set()
         if self.progress: self.progress.destroy(); self.progress=None
         self.busy=False
         if self.operation in ('check', 'check-all') and self.checker:
-            self.checker.finish(error=code != 0)
+            self.checker.finish(error=code != 0 and not cancelled,cancelled=cancelled)
         for c in self.controls: c.set_sensitive(True)
         self.profile_list.set_sensitive(True); self._update_detail()
-        if code:
+        if cancelled:
+            self._set_status('Операция отменена. Частичные результаты — в отчёте.')
+        elif code:
             self._set_status('Ошибка — подробности в отчёте', 'error')
         elif self.operation_results and any(r['state'] != 'green' for r in self.operation_results):
             self._set_status('Проверка завершена: есть ограничения — см. карточки сервисов')

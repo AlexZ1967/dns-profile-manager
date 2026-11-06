@@ -1,0 +1,18 @@
+# Static checks only. Unit tests are run by the project owner (see AGENTS.md):
+#   /usr/bin/python3 -m unittest discover -s tests -v
+#   ruff check .
+target-version = "py312"
+line-length = 160
+
+extend-exclude = [
+    ".local",
+    "__pycache__",
+]
+
+[lint]
+# Pyflakes plus runtime-error classes; style rules stay off because the
+# existing modules intentionally use a dense one-line style.
+select = ["F", "E9"]
+
+[lint.per-file-ignores]
+"deployment/dispatcher.py" = []

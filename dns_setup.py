@@ -171,11 +171,7 @@ class UserDeployment:
         manager.atomic_write(self.local/'backups'/(name+'.json'),text)
 
     def install_user(self, record, data):
-        routes=['# Generated DNS Manager command routing. Provider settings live in providers.json.']
-        for name,args in manager.command_map(data).items():
-            routes.append(f'{name}() {{ '+shlex.quote(str(self.project/'dnsctl'))+' '+' '.join(shlex.quote(a) for a in args)+' "$@"; }')
-        routes.append('dnsctl() { '+shlex.quote(str(self.project/'dnsctl'))+' "$@"; }')
-        manager.atomic_write(self.config/'commands.bash','\n'.join(routes)+'\n')
+        manager.atomic_write(self.config/'commands.bash','\n'.join(manager.command_routes(data, self.project))+'\n')
         original,updated=self.prepare_aliases()
         if original!=updated:
             self.backup('bash_aliases',original)
