@@ -6,6 +6,8 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 import unittest
 from unittest.mock import patch
 
@@ -103,10 +105,10 @@ class CoreTests(unittest.TestCase):
         self.assertFalse(result['ok']); self.assertIn('доступ ограничен',result['detail'])
 
     def _check(self, dns_ok=True, https_ok=True, one_bad_server=False):
-        def query(p,server,domain,timeout):
+        def query(p,server,domain,timeout,should_stop=None):
             good=dns_ok and not (one_bad_server and server==p['servers'][-1])
             return {'server':server,'domain':domain,'ok':good,'addresses':['203.0.113.7'] if good else [],'detail':'timeout' if not good else '', 'ms':2}
-        def https(domain,ip,timeout): return {'domain':domain,'address':ip,'ok':https_ok,'code':200 if https_ok else 403,'detail':'HTTP 200' if https_ok else 'HTTP 403'}
+        def https(domain,ip,timeout,path='/',should_stop=None): return {'domain':domain,'address':ip,'ok':https_ok,'code':200 if https_ok else 403,'detail':'HTTP 200' if https_ok else 'HTTP 403'}
         with patch.object(m,'network_fingerprint',return_value='network'),patch.object(m,'route_info',return_value={'interface':'test0','gateway':'192.0.2.1'}),patch.object(m,'dns_query',side_effect=query),patch.object(m,'https_query',side_effect=https),patch.object(m.shutil,'which',return_value='/usr/bin/tool'):
             return m.check_provider('magic')
 
@@ -129,6 +131,17 @@ class CoreTests(unittest.TestCase):
                 with self.assertRaises(m.ManagerError): m.apply_profile('magic')
                 popen.assert_not_called()
 
+    def test_cancelled_probe_terminates_child_process(self):
+        cancel=threading.Event()
+        timer=threading.Timer(0.2,cancel.set);timer.start()
+        started=time.monotonic()
+        try:
+            result=m.run([sys.executable,'-c','import time; time.sleep(10)'],timeout=12,should_stop=cancel.is_set)
+        finally:
+            timer.cancel()
+        self.assertEqual(result.returncode,130)
+        self.assertLess(time.monotonic()-started,2)
+
     def test_apply_uses_current_config_and_existing_network_functions(self):
         p=m.provider(self.data,'magic'); p['servers']=['203.0.113.19']
         m.save_config(self.data,install=False)
@@ -147,6 +160,17 @@ class ExistingNetworkHelperTests(unittest.TestCase):
         path=root/'network.bash'
         path.write_text("DNS_ETH_UUID='00000000-0000-0000-0000-000000000001'\nDNS_WIFI_UUID='00000000-0000-0000-0000-000000000002'\nDNS_INTERFACES=(enp5s0 wlp4s0)\nDNS_PROFILE_CONF='"+str(root/'profile.conf')+"'\nDNS_LEGACY_CONFS=('"+str(root/'legacy')+"')\n")
         return path
+    def test_root_path_validation_rejects_unmanaged_files(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            settings=self.settings(Path(tmp))
+            script='source "$1" || exit; DNS_PROFILE_CONF="$2"; DNS_LEGACY_CONFS=("$3"); _dns_validate_network_settings 0'
+            env={**os.environ,'DNS_MANAGER_NETWORK_CONFIG':str(settings)}
+            bad=subprocess.run(['bash','-c',script,'_',str(m.NETWORK_BACKEND),'/etc/sudoers','/etc/shadow'],capture_output=True,text=True,env=env)
+            self.assertNotEqual(bad.returncode,0)
+            good=subprocess.run(['bash','-c',script,'_',str(m.NETWORK_BACKEND),
+                '/etc/systemd/resolved.conf.d/90-dns-profile-manager.conf',
+                '/etc/systemd/resolved.conf.d/dagami.conf'],capture_output=True,text=True,env=env)
+            self.assertEqual(good.returncode,0,good.stderr)
     def test_only_known_active_connections_reapplied(self):
         # Execute the real Bash helper with fake nmcli; no sudo or network changes.
         with tempfile.TemporaryDirectory() as tmp:
@@ -269,6 +293,7 @@ if name=='nmcli' and args==['-t','-f','UUID,DEVICE','connection','show','--activ
 if name=='nmcli' and args==['-t','--escape','no','-f','UUID,TYPE,DEVICE','connection','show','--active']:
     print(os.environ['ETH']+':802-3-ethernet:enp5s0')
 if name=='nmcli' and args[:5]==['-t','--escape','no','-g','ipv4.ignore-auto-dns,ipv4.dns,ipv6.ignore-auto-dns,ipv6.dns']:
+    assert args[5:]==['connection','show',os.environ['ETH']],args
     print('no\n192.0.2.1\nno\n--')
 if name=='nmcli' and 'modify' in args and 'yes' in args and os.environ.get('MODIFY_FAIL')=='1':
     print('Fixture: connection modify failed',file=sys.stderr);sys.exit(2)

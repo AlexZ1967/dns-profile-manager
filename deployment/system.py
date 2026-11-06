@@ -145,11 +145,14 @@ class SystemDeployment:
         return result
 
     def check_files(self, journal):
+        uninstall_removed = set(journal.get('uninstall_removed', [])) if journal.get('phase') == 'uninstalling' else set()
+        uninstall_pending = set(journal.get('uninstall_pending', [])) if journal.get('phase') == 'uninstalling' else set()
         for name, expected in journal.get('installed',{}).items():
             if name==journal['network']['profile_file']:continue
             actual=snapshot(self.path(name))
             # During rollback a step may still have its original value.
-            if actual!=expected and actual!=journal['before'].get(name):
+            expected_uninstall_absence = name in (uninstall_removed | uninstall_pending) and actual == {'kind': 'absent'}
+            if actual!=expected and actual!=journal['before'].get(name) and not expected_uninstall_absence:
                 raise SetupError('Системный файл изменён вне приложения, не перезаписываю: '+name)
         profile=journal['network']['profile_file'];current=snapshot(self.path(profile));original=journal['before'][profile]
         if current['kind']!='absent' and current!=original:
@@ -271,12 +274,24 @@ class SystemDeployment:
         if journal is None:return {'phase':'uninstalled','installation_id':plan['installation_id']}
         self.check_files(journal)
         journal['phase']='uninstalling';self.save(journal)
+        removed = set(journal.get('uninstall_removed', []))
+        pending = set(journal.get('uninstall_pending', []))
         with self.locked(ROUTE_LOCK):
             # Queued Dispatcher callbacks recheck config after acquiring this same lock.
             names=[DISPATCHER,ROOT_CONFIG,NM_CONFIG,journal['network']['profile_file']]
             names.extend(name for name in (LEGACY_DISPATCHER,*LEGACY_DNS_PROFILES) if name in journal['before'])
             for name in names:
-                if os.path.lexists(self.path(name)):self.path(name).unlink()
+                if name not in removed:
+                    if name not in pending:
+                        pending.add(name)
+                        journal['uninstall_pending']=sorted(pending)
+                        self.save(journal)
+                    if os.path.lexists(self.path(name)):self.path(name).unlink()
+                    removed.add(name)
+                    pending.discard(name)
+                    journal['uninstall_removed']=sorted(removed)
+                    journal['uninstall_pending']=sorted(pending)
+                    self.save(journal)
             # Keep the OS resolver working in DHCP mode, including a formerly clean machine.
             restore(self.path(RESOLV),{'kind':'symlink','target':RESOLVED_STUB})
             self.run(['/usr/bin/systemctl','enable','--now','systemd-resolved.service'])

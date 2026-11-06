@@ -46,7 +46,7 @@ def numeric(data, name):
         return 0.0
 
 
-def probe_https(domain, address, timeout, run, path='/'):
+def probe_https(domain, address, timeout, run, path='/', should_stop=None):
     """One HTTPS hop; no curl config, proxy, cookies or implicit redirect DNS."""
     address = str(ipaddress.IPv4Address(address))
     started = time.monotonic()
@@ -59,7 +59,7 @@ def probe_https(domain, address, timeout, run, path='/'):
                 '--user-agent', 'DNS-Profile-Manager/1.1 (connection diagnostics)',
                 '--dump-header', str(header_file), '--output', str(body_file),
                 '--write-out', '%{json}', f'https://{domain}{path}']
-        response = run(args, timeout + 2)
+        response = run(args, timeout + 2, should_stop=should_stop) if should_stop else run(args, timeout + 2)
         try:
             payload = json.loads(response.stdout)
             if not isinstance(payload, dict):
@@ -119,7 +119,7 @@ def probe_https(domain, address, timeout, run, path='/'):
     }
 
 
-def follow_https(domain, address, timeout, probe, resolve):
+def follow_https(domain, address, timeout, probe, resolve, should_stop=None):
     """Follow up to five HTTPS redirects, resolving every new host with the same DNS provider."""
     start = time.monotonic()
     deadline = start + timeout
@@ -128,6 +128,9 @@ def follow_https(domain, address, timeout, probe, resolve):
     pinned = {domain: address}
     failure = None
     for _ in range(6):
+        if should_stop and should_stop():
+            failure = 'Проверка отменена'
+            break
         if url in visited:
             failure = 'Обнаружен цикл HTTP-перенаправлений'
             break
@@ -165,7 +168,10 @@ def follow_https(domain, address, timeout, probe, resolve):
             failure = 'Истёк общий таймаут HTTPS и перенаправлений'
             break
         path = (parsed.path or '/') + ('?' + parsed.query if parsed.query else '')
-        hop = probe(host, pinned[host], remaining) if path == '/' else probe(host, pinned[host], remaining, path=path)
+        if path == '/':
+            hop = probe(host, pinned[host], remaining, should_stop=should_stop) if should_stop else probe(host, pinned[host], remaining)
+        else:
+            hop = probe(host, pinned[host], remaining, path=path, should_stop=should_stop) if should_stop else probe(host, pinned[host], remaining, path=path)
         hops.append(hop)
         if not (300 <= hop['code'] < 400):
             break

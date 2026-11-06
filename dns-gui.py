@@ -181,6 +181,7 @@ class DnsGui(Gtk.Window):
         self.selected_id = self.data['providers'][0]['id']
         self.initial_selection = True
         self.refresh_generation = 0
+        self.refresh_in_progress = False
         self.controls = []
         self.health = {}
         self.badges = {}
@@ -260,7 +261,6 @@ class DnsGui(Gtk.Window):
         diagnostics = box(Gtk.Orientation.HORIZONTAL,8)
         diagnostics.add(self._button('Проверить все',self.check_all))
         diagnostics.add(self._button('Статус DNS',lambda _:self._start_task('Получаю статус DNS…','status')))
-        diagnostics.add(self._button('DNS от провайдера (DHCP)',lambda _:self._apply('provider')))
         main.pack_start(diagnostics,False,False,0)
 
         report_card = box(css='report-card')
@@ -310,7 +310,8 @@ class DnsGui(Gtk.Window):
         servers = ', '.join(p['servers']) if p['servers'] else 'DHCP активных подключений'
         self.addresses.set_text(f'{manager.MODE_NAMES[p["mode"]]} · {servers}\n' + (f'TLS: {p["tls_hostname"]} · ' if p['mode']=='dot' else '') + f'CLI: {p["command"]}')
         active = self.current.get('id') == p['id'] and self.current.get('config_matches') and self.current.get('effective_matches')
-        self.apply_button.set_label('Уже подключён' if active else 'Применить')
+        apply_label = 'Уже подключён' if active else 'Получать DNS по DHCP' if p['mode'] == 'dhcp' else 'Применить'
+        self.apply_button.set_label(apply_label)
         self.apply_button.set_sensitive(not self.busy and not active)
         item = self.health.get(p['id'])
         state = item['state'] if item else 'unknown'
@@ -345,8 +346,9 @@ class DnsGui(Gtk.Window):
         if state: context.add_class(state)
 
     def refresh_profile(self):
-        if self.busy: return
+        if self.busy or self.refresh_in_progress: return
         self.refresh_generation += 1; generation = self.refresh_generation
+        self.refresh_in_progress = True
         self.refresh_button.set_sensitive(False)
         def worker():
             try:
@@ -358,7 +360,9 @@ class DnsGui(Gtk.Window):
         threading.Thread(target=worker,daemon=True).start()
 
     def _loaded(self,generation,data,state,health,error):
-        if generation != self.refresh_generation or self.busy: return False
+        if generation != self.refresh_generation: return False
+        self.refresh_in_progress = False
+        if self.busy: return False
         self.refresh_button.set_sensitive(True)
         if error:
             self.current_label.set_text('Ошибка чтения состояния'); self._set_status(error,'error'); return False
@@ -399,7 +403,7 @@ class DnsGui(Gtk.Window):
     def _on_config_activity(self,*_):
         if self.busy or self._config_pending: return None
         self._config_pending = True
-        GLib.timeout_add(GLib.PRIORITY_DEFAULT_IDLE,800,self._config_refresh_timeout)
+        GLib.timeout_add(800,self._config_refresh_timeout,priority=GLib.PRIORITY_DEFAULT_IDLE)
         return None
 
     def _config_refresh_timeout(self):
@@ -489,7 +493,7 @@ class DnsGui(Gtk.Window):
         self.operation = operation
         self.operation_results = []
         self.cancel_event.clear()
-        self.busy=True; self.refresh_generation+=1; self.buffer.set_text(''); self._set_status(title)
+        self.busy=True; self.refresh_generation+=1; self.refresh_in_progress=False; self.buffer.set_text(''); self._set_status(title)
         for c in self.controls: c.set_sensitive(False)
         self.profile_list.set_sensitive(False)
         if checking:
@@ -497,7 +501,7 @@ class DnsGui(Gtk.Window):
         else:
             # Switching DNS is one short privileged operation; it must not be interrupted.
             self._show_progress(title,operation in ('status','details'))
-        def emit(text): GLib.idle_add(GLib.PRIORITY_DEFAULT_IDLE,self._receive_line,text)
+        def emit(text): GLib.idle_add(self._receive_line,text,priority=GLib.PRIORITY_DEFAULT_IDLE)
         def worker():
             code=0
             try:
@@ -511,7 +515,7 @@ class DnsGui(Gtk.Window):
                             break
                         def event(packet, index=index):
                             packet = dict(packet, overall_progress=(index + packet.get('progress', 0)) / len(ids), batch_index=index+1, batch_total=len(ids))
-                            GLib.idle_add(GLib.PRIORITY_DEFAULT_IDLE,self._checker_event, packet)
+                            GLib.idle_add(self._checker_event,packet,priority=GLib.PRIORITY_DEFAULT_IDLE)
                         try:
                             result=manager.check_provider(item,emit,on_event=event,should_stop=self.cancel_event.is_set)
                         except Exception as exc:
@@ -520,13 +524,13 @@ class DnsGui(Gtk.Window):
                             else:
                                 code=1; emit('Ошибка: '+str(exc))
                             continue
-                        GLib.idle_add(GLib.PRIORITY_DEFAULT_IDLE,self._receive_health,result)
+                        GLib.idle_add(self._receive_health,result,priority=GLib.PRIORITY_DEFAULT_IDLE)
             except Exception as exc:
                 if self.cancel_event.is_set():
                     emit('Операция отменена.')
                 else:
                     code=1; emit('Ошибка: '+str(exc))
-            GLib.idle_add(GLib.PRIORITY_DEFAULT_IDLE,self._finish,code)
+            GLib.idle_add(self._finish,code,priority=GLib.PRIORITY_DEFAULT_IDLE)
         threading.Thread(target=worker,daemon=True).start()
 
     def _cancel_clicked(self,_button):
@@ -550,7 +554,7 @@ class DnsGui(Gtk.Window):
             self.progress_label.set_text(text[-250:])
         self._pending_report.append(text)
         if not self._flush_scheduled:
-            self._flush_scheduled=GLib.timeout_add(GLib.PRIORITY_DEFAULT_IDLE,150,self._flush_report)
+            self._flush_scheduled=GLib.timeout_add(150,self._flush_report,priority=GLib.PRIORITY_DEFAULT_IDLE)
         return False
 
     def _flush_report(self):

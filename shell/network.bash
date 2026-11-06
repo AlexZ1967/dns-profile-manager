@@ -28,6 +28,32 @@ _dns_load_network_settings() {
        [[ -z "${DNS_ETH_UUID:-}" || -z "${DNS_WIFI_UUID:-}" || -z "${DNS_INTERFACES[1]:-}" ]]; then
         printf 'DNS Manager: отсутствуют подключения в %s\n' "$settings" >&2; return 1
     fi
+    _dns_validate_network_settings || return 1
+}
+
+# Validate again after sudo: settings can be edited after the interactive shell
+# loaded them. Non-root test helpers use temporary paths; root accepts only the
+# fixed application-owned resolved.conf.d names below.
+_dns_validate_network_settings() {
+    local privilege_level="${1:-$EUID}"
+    (( privilege_level != 0 )) && return 0
+    case "$DNS_PROFILE_CONF" in
+        /etc/systemd/resolved.conf.d/90-dns-profile-manager.conf|\
+        /etc/systemd/resolved.conf.d/90-alex-dns-profile.conf) ;;
+        *) printf 'DNS Manager: запрещённый путь DNS-профиля: %s\n' "$DNS_PROFILE_CONF" >&2; return 1 ;;
+    esac
+    local legacy
+    for legacy in "${DNS_LEGACY_CONFS[@]}"; do
+        case "$legacy" in
+            /etc/systemd/resolved.conf.d/dns-ai.conf|\
+            /etc/systemd/resolved.conf.d/dagami.conf|\
+            /etc/systemd/resolved.conf.d/magicdns.conf) ;;
+            *) printf 'DNS Manager: запрещённый legacy-путь DNS: %s\n' "$legacy" >&2; return 1 ;;
+        esac
+    done
+    if [[ -n "${DNS_INSTALLATION_ID:-}" && ! "$DNS_INSTALLATION_ID" =~ ^[0-9a-fA-F]{8}-([0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}$ ]]; then
+        printf 'DNS Manager: некорректный ID установки.\n' >&2; return 1
+    fi
 }
 _dns_load_network_settings || return 1
 
@@ -88,9 +114,9 @@ _dns_nm_configure() {
 # Values unreadable by nmcli are restored empty; devices are reapplied by the
 # rollback in _dns_apply_as_root. Never executes outside _dns_apply_as_root.
 _dns_capture_connection_state() {
-    local uuid fields index value
+    local uuid iface fields index value
     local -a values
-    while IFS= read -r uuid; do
+    while IFS='|' read -r uuid iface; do
         [[ -n "$uuid" ]] || continue
         fields="$(nmcli -t --escape no -g \
             ipv4.ignore-auto-dns,ipv4.dns,ipv6.ignore-auto-dns,ipv6.dns connection show "$uuid")" || return 1
@@ -123,6 +149,7 @@ _dns_apply_as_root() (
     local lock_fd entries config staged_conf previous_conf previous_connections
     local lock_file=/run/lock/nm-dns-primary-route.lock
     umask 022
+    _dns_validate_network_settings || return 1
     if [[ -L "$lock_file" ]]; then
         echo 'Небезопасный файл блокировки Dispatcher (симлинк). Операция прервана.' >&2
         return 1
@@ -209,7 +236,7 @@ _dns_privileged_apply() (
             script+="$(declare -p "$variable")"$'\n'
         fi
     done
-    script+="$(declare -f _dns_active_connections _dns_nm_configure _dns_apply_as_root _dns_capture_connection_state _dns_restore_connection_state)"$'\n'
+    script+="$(declare -f _dns_active_connections _dns_nm_configure _dns_validate_network_settings _dns_apply_as_root _dns_capture_connection_state _dns_restore_connection_state)"$'\n'
     script+='_dns_apply_as_root "$@"'
     # One authorization covers writing resolved config, nmcli and service reload.
     # GUI substitutes sudo -A here; there are no nested sudo/Polkit requests.

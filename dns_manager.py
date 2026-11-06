@@ -46,7 +46,33 @@ class ManagerError(Exception):
     pass
 
 
-def run(args, timeout=12, **kwargs):
+def run(args, timeout=12, should_stop=None, **kwargs):
+    if should_stop:
+        process = None
+        try:
+            if should_stop():
+                return subprocess.CompletedProcess(args, 130, '', 'Операция отменена')
+            process = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                       text=True, errors='replace', **kwargs)
+            deadline = time.monotonic() + timeout
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0 or should_stop():
+                    process.terminate()
+                    try:
+                        stdout, stderr = process.communicate(timeout=0.5)
+                    except subprocess.TimeoutExpired:
+                        process.kill(); stdout, stderr = process.communicate()
+                    if remaining <= 0:
+                        return subprocess.CompletedProcess(args, 124, stdout, f'Таймаут ({timeout} с)')
+                    return subprocess.CompletedProcess(args, 130, stdout, stderr or 'Операция отменена')
+                try:
+                    stdout, stderr = process.communicate(timeout=min(0.1, remaining))
+                    return subprocess.CompletedProcess(args, process.returncode, stdout, stderr)
+                except subprocess.TimeoutExpired:
+                    continue
+        except OSError as exc:
+            return subprocess.CompletedProcess(args, 127, '', str(exc))
     try:
         return subprocess.run(args, capture_output=True, text=True, errors='replace', timeout=timeout, **kwargs)
     except subprocess.TimeoutExpired:
@@ -437,12 +463,12 @@ def dhcp_servers():
     return servers
 
 
-def dns_query(p, server, domain, timeout):
+def dns_query(p, server, domain, timeout, should_stop=None):
     args = ['kdig', '@' + server, '-p', str(p['port']), domain, 'A', '+json', f'+timeout={timeout}', '+retry=0']
     if p['mode'] == 'dot':
         args += ['+tls-ca', '+tls-hostname=' + p['tls_hostname'], '+tls-sni=' + p['tls_hostname']]
     started = time.monotonic()
-    response = run(args, timeout + 2)
+    response = run(args, timeout + 2, should_stop=should_stop) if should_stop else run(args, timeout + 2)
     addresses, reason = [], ''
     try:
         body = json.loads(response.stdout)
@@ -466,8 +492,8 @@ def dns_query(p, server, domain, timeout):
             'addresses': addresses, 'detail': reason, 'ms': round((time.monotonic()-started)*1000)}
 
 
-def https_query(domain, address, timeout, path='/'):
-    return probes.probe_https(domain, address, timeout, run, path)
+def https_query(domain, address, timeout, path='/', should_stop=None):
+    return probes.probe_https(domain, address, timeout, run, path, should_stop)
 
 
 def check_provider(ident, emit=None, on_event=None, should_stop=None):
@@ -512,7 +538,7 @@ def _check_provider(ident, emit=None, on_event=None, should_stop=None):
         if emit:
             emit(f'{p["name"]}: прямые DNS-запросы ({MODE_NAMES[p["mode"]]}), системный профиль не меняется.')
         with concurrent.futures.ThreadPoolExecutor(max_workers=6) as pool:
-            futures = [pool.submit(dns_query, p, server, domain, data['dns_timeout']) for server in servers for domain in domains]
+            futures = [pool.submit(dns_query, p, server, domain, data['dns_timeout'], stopped) for server in servers for domain in domains]
             dns_total = len(futures)
             for count, future in enumerate(concurrent.futures.as_completed(futures), 1):
                 answer = future.result()
@@ -535,10 +561,10 @@ def _check_provider(ident, emit=None, on_event=None, should_stop=None):
                     return []
                 # Independent pool avoids waiting on workers occupied by HTTPS requests.
                 with concurrent.futures.ThreadPoolExecutor(max_workers=min(4, len(servers))) as redirects:
-                    queries = [redirects.submit(dns_query, p, server, host, min(data['dns_timeout'], remaining)) for server in servers]
+                    queries = [redirects.submit(dns_query, p, server, host, min(data['dns_timeout'], remaining), stopped) for server in servers]
                     return [query.result() for query in queries]
 
-            futures = [pool.submit(probes.follow_https, domain, ip, data['https_timeout'], https_query, resolve_redirect) for domain, ip in pairs]
+            futures = [pool.submit(probes.follow_https, domain, ip, data['https_timeout'], https_query, resolve_redirect, stopped) for domain, ip in pairs]
             for count, future in enumerate(concurrent.futures.as_completed(futures), 1):
                 answer = future.result()
                 result['https'].append(answer)

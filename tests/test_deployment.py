@@ -30,7 +30,7 @@ def network():
 class FakeCommands:
     def __init__(self):
         self.calls=[];self.values=dict(zip(FIELDS,['no','8.8.8.8','no','']))
-        self.service_active=False;self.service_enabled=False;self.fail_sync=False
+        self.service_active=False;self.service_enabled=False;self.fail_sync=False;self.fail_general_reload=False
 
     def __call__(self,args,check=True):
         self.calls.append(args);text='';code=0
@@ -45,6 +45,9 @@ class FakeCommands:
             elif op=='disable':self.service_enabled=False
             elif op=='restart':self.service_active=True
         elif 'nmcli' in args[0]:
+            if args[1:]==['general','reload'] and self.fail_general_reload:
+                self.fail_general_reload=False
+                raise SetupError('simulated NetworkManager reload failure')
             if '-g' in args:
                 field=args[args.index('-g')+1]
                 text='802-3-ethernet' if field=='connection.type' else self.values[field]
@@ -85,6 +88,18 @@ class SystemDeploymentTests(unittest.TestCase):
         self.assertTrue(self.run.service_active);self.assertTrue(self.run.service_enabled)
         for name in (DISPATCHER,ROOT_CONFIG,NM_CONFIG,JOURNAL,PROFILE):self.assertFalse(self.engine.path(name).exists())
         self.assertFalse(any('down' in call or 'NetworkManager' in call and 'restart' in call for call in self.run.calls))
+
+    def test_uninstall_resumes_after_failure_during_system_cleanup(self):
+        self.engine.install(self.plan)
+        self.run.fail_general_reload=True
+        with self.assertRaises(SetupError):self.engine.uninstall(self.plan)
+        journal=self.engine.read()
+        self.assertEqual(journal['phase'],'uninstalling')
+        self.assertTrue(journal['uninstall_removed'])
+        # Files already removed by the first attempt are recognized as our own work.
+        result=self.engine.uninstall(self.plan)
+        self.assertEqual(result['phase'],'uninstalled')
+        self.assertEqual(self.run.values,dict(zip(FIELDS,['no','','no',''])))
 
     def test_failure_rolls_back(self):
         self.run.fail_sync=True

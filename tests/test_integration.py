@@ -31,7 +31,7 @@ class IntegrationTests(unittest.TestCase):
 DNS_ETH_UUID='00000000-0000-0000-0000-000000000001'
 DNS_WIFI_UUID='00000000-0000-0000-0000-000000000002'
 DNS_INTERFACES=('enp5s0' 'wlp4s0')
-DNS_PROFILE_CONF='/etc/systemd/resolved.conf.d/90-existing-profile.conf'
+DNS_PROFILE_CONF='/etc/systemd/resolved.conf.d/90-dns-profile-manager.conf'
 DNS_LEGACY_CONFS=(
     '/etc/systemd/resolved.conf.d/dns-ai.conf'
     '/etc/systemd/resolved.conf.d/dagami.conf'
@@ -62,7 +62,7 @@ source ''' + str(self.config.parent/'commands.bash') + '\n'
         self.assertNotIn('DNS_ETH_UUID',self.aliases.read_text())
         settings=integrate.declarations(self.network.read_text())
         self.assertEqual(settings['DNS_ETH_UUID'],'00000000-0000-0000-0000-000000000001')
-        self.assertEqual(settings['DNS_PROFILE_CONF'],'/etc/systemd/resolved.conf.d/90-existing-profile.conf')
+        self.assertEqual(settings['DNS_PROFILE_CONF'],'/etc/systemd/resolved.conf.d/90-dns-profile-manager.conf')
         self.assertEqual(json.loads(self.config.read_text()),providers)
         self.assertEqual(self.network.stat().st_mode & 0o777,0o600)
         backups=list((self.config.parent/'backups').glob('bash_aliases.*'))
@@ -92,6 +92,14 @@ source ''' + str(self.config.parent/'commands.bash') + '\n'
         with self.assertRaises(m.ManagerError):self.migrate()
         self.assertEqual(self.aliases.read_text(),before)
         self.assertIn('000000000099',self.network.read_text())
+
+    def test_legacy_system_paths_are_allowlisted_before_migration(self):
+        settings=integrate.declarations(self.legacy)
+        settings['DNS_PROFILE_CONF']='/etc/sudoers'
+        with self.assertRaises(m.ManagerError):integrate.validate_network_settings(settings)
+        settings=integrate.declarations(self.legacy)
+        settings['DNS_LEGACY_CONFS']=['/etc/shadow']
+        with self.assertRaises(m.ManagerError):integrate.validate_network_settings(settings)
 
     def test_extra_command_in_hook_is_preserved_by_refusing_rewrite(self):
         self.migrate()

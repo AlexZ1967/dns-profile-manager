@@ -13,6 +13,15 @@ HOOK_END = '# <<< DNS Profile Manager <<<'
 LEGACY_START = '# DNS профили:'
 LEGACY_HOOK = '# DNS Manager: shared provider configuration and generated CLI commands.'
 NETWORK_NAMES = ('DNS_ETH_UUID', 'DNS_WIFI_UUID', 'DNS_INTERFACES', 'DNS_PROFILE_CONF', 'DNS_LEGACY_CONFS')
+PROFILE_PATHS = {
+    '/etc/systemd/resolved.conf.d/90-dns-profile-manager.conf',
+    '/etc/systemd/resolved.conf.d/90-alex-dns-profile.conf',
+}
+LEGACY_PROFILE_PATHS = {
+    '/etc/systemd/resolved.conf.d/dns-ai.conf',
+    '/etc/systemd/resolved.conf.d/dagami.conf',
+    '/etc/systemd/resolved.conf.d/magicdns.conf',
+}
 OWNED_VARIABLES = set(NETWORK_NAMES) | {'DNS_XBOX_SERVERS', 'DNS_AI_SERVERS', 'DNS_DAGAMI_SERVERS', 'DNS_MAGIC_SERVERS', 'DNS_AI_DIR', 'DNS_AI_SCRIPT', 'DNS_AI_URL'}
 OWNED_FUNCTIONS = {'_dns_active_connections', '_dns_nm_configure', '_dns_clear_profiles', '_dns_switch', '_dns_provider_apply',
                    'dns-provider', 'xbox-dns-on', 'xbox-dns-off', 'dns-ai-on', 'dns-ai-off', 'dns-ai-update',
@@ -135,11 +144,12 @@ def validate_network_settings(settings):
     interfaces = settings['DNS_INTERFACES']
     if not isinstance(interfaces,list) or len(interfaces) != 2 or any(not re.fullmatch(r'[a-zA-Z0-9_.-]{1,15}', item) for item in interfaces):
         raise manager.ManagerError('Нужны два корректных имени интерфейсов: Ethernet и Wi-Fi.')
-    if not isinstance(settings['DNS_PROFILE_CONF'],str) or not Path(settings['DNS_PROFILE_CONF']).is_absolute():
-        raise manager.ManagerError('Путь управляемого профиля resolved должен быть абсолютным.')
+    if not isinstance(settings['DNS_PROFILE_CONF'], str) or settings['DNS_PROFILE_CONF'] not in PROFILE_PATHS:
+        raise manager.ManagerError('Путь управляемого профиля resolved не входит в список поддерживаемых.')
     legacy = settings['DNS_LEGACY_CONFS']
-    if not isinstance(legacy,list) or any(not Path(item).is_absolute() for item in legacy):
-        raise manager.ManagerError('Некорректные пути прежних конфигураций DNS.')
+    if (not isinstance(legacy, list) or any(not isinstance(item, str) for item in legacy)
+            or len(legacy) != len(set(legacy)) or any(item not in LEGACY_PROFILE_PATHS for item in legacy)):
+        raise manager.ManagerError('Разрешены только известные пути прежних конфигураций DNS.')
     return settings
 
 
