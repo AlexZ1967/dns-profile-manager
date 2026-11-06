@@ -88,12 +88,20 @@ _dns_nm_configure() {
 # Values unreadable by nmcli are restored empty; devices are reapplied by the
 # rollback in _dns_apply_as_root. Never executes outside _dns_apply_as_root.
 _dns_capture_connection_state() {
-    local uuid fields
+    local uuid fields index value
+    local -a values
     while IFS= read -r uuid; do
         [[ -n "$uuid" ]] || continue
         fields="$(nmcli -t --escape no -g \
-            ipv4.ignore-auto-dns,ipv4.dns,ipv6.ignore-auto-dns,ipv6.dns connection show "$uuid")"
-        printf '%s|%s\n' "$uuid" "$(tr '\n' '|' <<<"$fields")"
+            ipv4.ignore-auto-dns,ipv4.dns,ipv6.ignore-auto-dns,ipv6.dns connection show "$uuid")" || return 1
+        mapfile -t values <<< "$fields"
+        printf '%s' "$uuid"
+        for index in 0 1 2 3; do
+            value="${values[index]:-}"
+            [[ "$value" == '--' ]] && value=''
+            printf '|%s' "$value"
+        done
+        printf '\n'
     done
 }
 
@@ -134,7 +142,10 @@ _dns_apply_as_root() (
     # DNS fields. Legacy confs removed on this run are not restored; they are ours.
     previous_conf=''
     [[ -f "$DNS_PROFILE_CONF" && -r "$DNS_PROFILE_CONF" ]] && previous_conf="$(<"$DNS_PROFILE_CONF")"
-    previous_connections="$(_dns_capture_connection_state <<<"$entries")"
+    previous_connections="$(_dns_capture_connection_state <<<"$entries")" || {
+        echo 'Не удалось сохранить текущие параметры NetworkManager; переключение отменено.' >&2
+        return 1
+    }
 
     _dns_apply_rollback() {
         echo 'Внимание: применить настройки NetworkManager не удалось, восстанавливаю прежние параметры DNS...' >&2

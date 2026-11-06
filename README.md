@@ -1,6 +1,6 @@
 # DNS Profile Manager
 
-Текущая версия: **1.2.1**. История изменений — [CHANGELOG.md](CHANGELOG.md). Номер релиза хранится в [VERSION](VERSION); CLI и GUI используют одну версию по схеме `MAJOR.MINOR.PATCH`.
+Текущая версия: **1.2.2**. История изменений — [CHANGELOG.md](CHANGELOG.md). Номер релиза хранится в [VERSION](VERSION); CLI и GUI используют одну версию по схеме `MAJOR.MINOR.PATCH`.
 
 Менеджер DNS для Linux Mint / NetworkManager / systemd-resolved: CLI, терминальное меню и GTK-интерфейс используют общую конфигурацию и один механизм переключения.
 

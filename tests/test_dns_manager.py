@@ -268,6 +268,8 @@ if name=='nmcli' and args==['-t','-f','UUID,DEVICE','connection','show','--activ
     print(os.environ['ETH']+':enp5s0')
 if name=='nmcli' and args==['-t','--escape','no','-f','UUID,TYPE,DEVICE','connection','show','--active']:
     print(os.environ['ETH']+':802-3-ethernet:enp5s0')
+if name=='nmcli' and args[:5]==['-t','--escape','no','-g','ipv4.ignore-auto-dns,ipv4.dns,ipv6.ignore-auto-dns,ipv6.dns']:
+    print('no\n192.0.2.1\nno\n--')
 if name=='nmcli' and 'modify' in args and 'yes' in args and os.environ.get('MODIFY_FAIL')=='1':
     print('Fixture: connection modify failed',file=sys.stderr);sys.exit(2)
 if name=='sudo':
@@ -298,6 +300,8 @@ if name in ['mkdir','chmod','mv','rm']:
             restores=[e for e in entries if e[:3]==['nmcli','connection','modify'] and 'yes' not in e]
             self.assertEqual(len(restores),1)
             self.assertIn('no',restores[0])
+            self.assertIn('192.0.2.1',restores[0])
+            self.assertNotIn('--',restores[0])
             self.assertEqual(sum(e[:3]==['nmcli','device','reapply'] and e[3]=='enp5s0' for e in entries),1)
             # Rollback restarts resolved so the restored configuration takes effect.
             self.assertEqual(sum(e[:2]==['systemctl','restart'] for e in entries),1)
