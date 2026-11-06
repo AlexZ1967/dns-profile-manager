@@ -154,6 +154,8 @@ def network_text(settings):
 
 
 def integrate():
+    if manager.NETWORK_CONFIG.suffix == ".json":
+        raise manager.ManagerError("Для этой установки используйте ./install вместо integrate.py.")
     for relative in ('shell/dns.bash', 'shell/network.bash'):
         path = manager.ROOT/relative
         if not path.is_file():

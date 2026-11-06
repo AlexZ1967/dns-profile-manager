@@ -253,7 +253,7 @@ class DnsGui(Gtk.Window):
 
         diagnostics = box(Gtk.Orientation.HORIZONTAL,8)
         diagnostics.add(self._button('Проверить все',self.check_all))
-        diagnostics.add(self._button('Диагностика сети',lambda _:self._start_task('Диагностика текущего DNS…','status')))
+        diagnostics.add(self._button('Статус DNS',lambda _:self._start_task('Получаю статус DNS…','status')))
         diagnostics.add(self._button('К провайдеру',lambda _:self._apply('provider')))
         main.pack_start(diagnostics,False,False,0)
 

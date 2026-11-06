@@ -21,13 +21,22 @@ import dns_diagnostics as probes
 
 ROOT = Path(__file__).resolve().parent
 __version__ = (ROOT / 'VERSION').read_text(encoding='utf-8').strip()
-CONFIG = Path(os.environ.get('DNS_MANAGER_CONFIG', str(Path.home() / '.config/dns-manager/providers.json')))
-CACHE = Path(os.environ.get('DNS_MANAGER_CACHE', str(Path.home() / '.cache/dns-manager')))
-# ALIASES is used only by the integration installer, never sourced by runtime commands.
+LOCAL = ROOT / '.local'
+_default_config = LOCAL / 'config/providers.json'
+if not _default_config.exists():
+    _default_config = Path.home() / '.config/dns-manager/providers.json'
+CONFIG = Path(os.environ.get('DNS_MANAGER_CONFIG', str(_default_config)))
+CACHE = Path(os.environ.get('DNS_MANAGER_CACHE', str(LOCAL / 'cache' if CONFIG.parent == LOCAL / 'config' else Path.home() / '.cache/dns-manager')))
 ALIASES = Path(os.environ.get('DNS_ALIASES_FILE', str(Path.home() / '.bash_aliases')))
 NETWORK_BACKEND = ROOT / 'shell/network.bash'
-NETWORK_CONFIG = Path(os.environ.get('DNS_MANAGER_NETWORK_CONFIG', str(CONFIG.parent / 'network.bash')))
+NETWORK_CONFIG = Path(os.environ.get('DNS_MANAGER_NETWORK_CONFIG', str(CONFIG.parent / ('network.json' if (CONFIG.parent / 'network.json').exists() else 'network.bash'))))
 PROFILE_FILE = Path('/etc/systemd/resolved.conf.d/90-alex-dns-profile.conf')
+if NETWORK_CONFIG.suffix == '.json' and NETWORK_CONFIG.exists():
+    import dns_network
+    try:
+        PROFILE_FILE = Path(dns_network.load(NETWORK_CONFIG)['profile_file'])
+    except (ValueError, OSError, TypeError, KeyError):
+        pass  # The backend reports invalid settings before any network mutation.
 MODE_NAMES = {'dhcp': 'DHCP', 'dot': 'DNS over TLS', 'plain': 'DNS · UDP/TCP'}
 DOMAIN = re.compile(r'(?=.{1,253}\Z)(?:[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)*[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\Z')
 RESERVED = {'dns-status', 'dns-details', 'dns-check', 'dns-ai-update', 'dns-menu', 'dns-gui', 'dns-manager'}
@@ -259,6 +268,8 @@ def install_commands(data):
 def save_config(data, install=True, expected_hash=None):
     validate_config(data)
     with lock(CACHE / 'operation.lock'), lock(CONFIG.parent / 'config.lock', blocking=True):
+        if install:
+            require_installation()
         if expected_hash and CONFIG.exists() and fingerprint(load_config()) != expected_hash:
             raise ManagerError('Конфиг изменён другим окном. Обновите список и повторите редактирование.')
         if install:
@@ -353,10 +364,26 @@ def current_state(data=None):
             'global_dns': global_line, 'config_file': str(CONFIG)}
 
 
+def machine_identifier():
+    return hashlib.sha256(Path('/etc/machine-id').read_bytes().strip()).hexdigest()
+
+
+def require_installation():
+    if CONFIG.parent == LOCAL / 'config':
+        record = LOCAL / 'installation.json'
+        try:
+            data = json.loads(record.read_text())
+        except (OSError, ValueError):
+            raise ManagerError('Выполните ./install на этом компьютере.')
+        if data.get('state') != 'installed' or data.get('machine_id') != machine_identifier():
+            raise ManagerError('Установка не активна на этом компьютере. Выполните ./install.')
+
+
 def apply_profile(ident, emit=print, gui=False):
     data = load_config()
     p = provider(data, ident)
     with lock(CACHE / 'operation.lock'):
+        require_installation()
         script = '''DNS_MANAGER_NETWORK_CONFIG="$2"
 source "$1" || exit 1
 if [[ "${DNS_MANAGER_GUI:-0}" == 1 ]]; then sudo() { /usr/bin/sudo -A "$@"; }; fi
